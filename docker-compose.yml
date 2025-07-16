@@ -1,0 +1,12 @@
+services:
+  headscale:
+    image: jqtype/headscale
+    restart: unless-stopped
+    container_name: headscale
+    init: true
+    expose:
+      - "8080"
+      - "9090"
+    volumes:
+      - ./ignored/data/config:/etc/headscale
+      - ./ignored/data/lib:/var/lib/headscale
