@@ -297,8 +297,10 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("dns.search_domains", []string{})
 
 	viper.SetDefault("derp.server.enabled", false)
+	viper.SetDefault("derp.server.verify_clients", true)
 	viper.SetDefault("derp.server.stun.enabled", true)
 	viper.SetDefault("derp.server.automatically_add_embedded_derp_region", true)
+	viper.SetDefault("derp.update_frequency", "3h")
 
 	viper.SetDefault("unix_socket", "/var/run/headscale/headscale.sock")
 	viper.SetDefault("unix_socket_permission", "0o770")
