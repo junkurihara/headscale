@@ -20,6 +20,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"tailscale.com/derp"
+	"tailscale.com/envknob"
 	"tailscale.com/net/stun"
 	"tailscale.com/net/wsconn"
 	"tailscale.com/tailcfg"
@@ -34,6 +35,11 @@ const (
 	fastStartHeader  = "Derp-Fast-Start"
 	DerpVerifyScheme = "headscale-derp-verify"
 )
+
+// debugUseDERPIP is a debug-only flag that causes the DERP server to resolve
+// hostnames to IP addresses when generating the DERP region configuration.
+// This is useful for integration testing where DNS resolution may be unreliable.
+var debugUseDERPIP = envknob.Bool("HEADSCALE_DEBUG_DERP_USE_IP")
 
 type DERPServer struct {
 	serverURL     string
@@ -70,7 +76,10 @@ func (d *DERPServer) GenerateRegion() (tailcfg.DERPRegion, error) {
 	}
 	var host string
 	var port int
-	host, portStr, err := net.SplitHostPort(serverURL.Host)
+	var portStr string
+
+	// Extract hostname and port from URL
+	host, portStr, err = net.SplitHostPort(serverURL.Host)
 	if err != nil {
 		if serverURL.Scheme == "https" {
 			host = serverURL.Host
@@ -83,6 +92,19 @@ func (d *DERPServer) GenerateRegion() (tailcfg.DERPRegion, error) {
 		port, err = strconv.Atoi(portStr)
 		if err != nil {
 			return tailcfg.DERPRegion{}, err
+		}
+	}
+
+	// If debug flag is set, resolve hostname to IP address
+	if debugUseDERPIP {
+		ips, err := net.LookupIP(host)
+		if err != nil {
+			log.Error().Caller().Err(err).Msgf("Failed to resolve DERP hostname %s to IP, using hostname", host)
+		} else if len(ips) > 0 {
+			// Use the first IP address
+			ipStr := ips[0].String()
+			log.Info().Caller().Msgf("HEADSCALE_DEBUG_DERP_USE_IP: Resolved %s to %s", host, ipStr)
+			host = ipStr
 		}
 	}
 
@@ -139,7 +161,7 @@ func (d *DERPServer) DERPHandler(
 			log.Error().
 				Caller().
 				Err(err).
-				Msg("Failed to write response")
+				Msg("Failed to write HTTP response")
 		}
 
 		return
@@ -177,7 +199,7 @@ func (d *DERPServer) serveWebsocket(writer http.ResponseWriter, req *http.Reques
 			log.Error().
 				Caller().
 				Err(err).
-				Msg("Failed to write response")
+				Msg("Failed to write HTTP response")
 		}
 
 		return
@@ -207,7 +229,7 @@ func (d *DERPServer) servePlain(writer http.ResponseWriter, req *http.Request) {
 			log.Error().
 				Caller().
 				Err(err).
-				Msg("Failed to write response")
+				Msg("Failed to write HTTP response")
 		}
 
 		return
@@ -223,7 +245,7 @@ func (d *DERPServer) servePlain(writer http.ResponseWriter, req *http.Request) {
 			log.Error().
 				Caller().
 				Err(err).
-				Msg("Failed to write response")
+				Msg("Failed to write HTTP response")
 		}
 
 		return
@@ -262,7 +284,7 @@ func DERPProbeHandler(
 			log.Error().
 				Caller().
 				Err(err).
-				Msg("Failed to write response")
+				Msg("Failed to write HTTP response")
 		}
 	}
 }
@@ -308,7 +330,7 @@ func DERPBootstrapDNSHandler(
 			log.Error().
 				Caller().
 				Err(err).
-				Msg("Failed to write response")
+				Msg("Failed to write HTTP response")
 		}
 	}
 }

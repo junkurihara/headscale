@@ -45,6 +45,7 @@ func (c Change) AlsoSelf() bool {
 	case NodeRemove, NodeKeyExpiry, NodeNewOrUpdate:
 		return true
 	}
+
 	return false
 }
 
@@ -94,6 +95,35 @@ func (c ChangeSet) Empty() bool {
 // IsFull reports whether the ChangeSet represents a full update.
 func (c ChangeSet) IsFull() bool {
 	return c.Change == Full || c.Change == Policy
+}
+
+func HasFull(cs []ChangeSet) bool {
+	for _, c := range cs {
+		if c.IsFull() {
+			return true
+		}
+	}
+	return false
+}
+
+func SplitAllAndSelf(cs []ChangeSet) (all []ChangeSet, self []ChangeSet) {
+	for _, c := range cs {
+		if c.SelfUpdateOnly {
+			self = append(self, c)
+		} else {
+			all = append(all, c)
+		}
+	}
+	return all, self
+}
+
+func RemoveUpdatesForSelf(id types.NodeID, cs []ChangeSet) (ret []ChangeSet) {
+	for _, c := range cs {
+		if c.NodeID != id || c.Change.AlsoSelf() {
+			ret = append(ret, c)
+		}
+	}
+	return ret
 }
 
 func (c ChangeSet) AlsoSelf() bool {

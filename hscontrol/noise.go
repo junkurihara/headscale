@@ -13,7 +13,6 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/net/http2"
-	"gorm.io/gorm"
 	"tailscale.com/control/controlbase"
 	"tailscale.com/control/controlhttp/controlhttpserver"
 	"tailscale.com/tailcfg"
@@ -176,8 +175,8 @@ func rejectUnsupported(
 			Int("client_cap_ver", int(version)).
 			Str("minimum_version", capver.TailscaleVersion(capver.MinSupportedCapabilityVersion)).
 			Str("client_version", capver.TailscaleVersion(version)).
-			Str("node_key", nkey.ShortString()).
-			Str("machine_key", mkey.ShortString()).
+			Str("node.key", nkey.ShortString()).
+			Str("machine.key", mkey.ShortString()).
 			Msg("unsupported client connected")
 		http.Error(writer, unsupportedClientError(version).Error(), http.StatusBadRequest)
 
@@ -283,7 +282,7 @@ func (ns *noiseServer) NoiseRegistrationHandler(
 	writer.WriteHeader(http.StatusOK)
 
 	if err := json.NewEncoder(writer).Encode(registerResponse); err != nil {
-		log.Error().Err(err).Msg("NoiseRegistrationHandler: failed to encode RegisterResponse")
+		log.Error().Caller().Err(err).Msg("NoiseRegistrationHandler: failed to encode RegisterResponse")
 		return
 	}
 
@@ -296,15 +295,10 @@ func (ns *noiseServer) NoiseRegistrationHandler(
 // getAndValidateNode retrieves the node from the database using the NodeKey
 // and validates that it matches the MachineKey from the Noise session.
 func (ns *noiseServer) getAndValidateNode(mapRequest tailcfg.MapRequest) (types.NodeView, error) {
-	node, err := ns.headscale.state.GetNodeByNodeKey(mapRequest.NodeKey)
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return types.NodeView{}, NewHTTPError(http.StatusNotFound, "node not found", nil)
-		}
-		return types.NodeView{}, NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("lookup node: %s", err), nil)
+	nv, ok := ns.headscale.state.GetNodeByNodeKey(mapRequest.NodeKey)
+	if !ok {
+		return types.NodeView{}, NewHTTPError(http.StatusNotFound, "node not found", nil)
 	}
-
-	nv := node.View()
 
 	// Validate that the MachineKey in the Noise session matches the one associated with the NodeKey.
 	if ns.machineKey != nv.MachineKey() {

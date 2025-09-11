@@ -10,18 +10,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/integration/hsic"
+	"github.com/juanfont/headscale/integration/integrationutil"
 	"github.com/juanfont/headscale/integration/tsic"
 	"github.com/rs/zerolog/log"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/exp/maps"
+	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
@@ -59,19 +62,29 @@ func TestPingAllByIP(t *testing.T) {
 	hs, err := scenario.Headscale()
 	require.NoError(t, err)
 
-	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-		all, err := hs.GetAllMapReponses()
-		assert.NoError(ct, err)
-
-		onlineMap := buildExpectedOnlineMap(all)
-		assertExpectedOnlineMapAllOnline(ct, len(allClients)-1, onlineMap)
-	}, 30*time.Second, 2*time.Second)
+	// Extract node IDs for validation
+	expectedNodes := make([]types.NodeID, 0, len(allClients))
+	for _, client := range allClients {
+		status := client.MustStatus()
+		nodeID, err := strconv.ParseUint(string(status.Self.ID), 10, 64)
+		require.NoError(t, err, "failed to parse node ID")
+		expectedNodes = append(expectedNodes, types.NodeID(nodeID))
+	}
+	requireAllClientsOnline(t, hs, expectedNodes, true, "all clients should be online across all systems", 30*time.Second)
 
 	// assertClientsState(t, allClients)
 
 	allAddrs := lo.Map(allIps, func(x netip.Addr, index int) string {
 		return x.String()
 	})
+
+	// Get headscale instance for batcher debug check
+	headscale, err := scenario.Headscale()
+	assertNoErr(t, err)
+
+	// Test our DebugBatcher functionality
+	t.Logf("Testing DebugBatcher functionality...")
+	requireAllClientsOnline(t, headscale, expectedNodes, true, "all clients should be connected to the batcher", 30*time.Second)
 
 	success := pingAllHelper(t, allClients, allAddrs)
 	t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
@@ -547,6 +560,8 @@ func TestUpdateHostnameFromClient(t *testing.T) {
 	err = scenario.WaitForTailscaleSync()
 	assertNoErrSync(t, err)
 
+	// Wait for nodestore batch processing to complete
+	// NodeStore batching timeout is 500ms, so we wait up to 1 second
 	var nodes []*v1.Node
 	assert.EventuallyWithT(t, func(ct *assert.CollectT) {
 		err := executeAndUnmarshal(
@@ -642,27 +657,34 @@ func TestUpdateHostnameFromClient(t *testing.T) {
 	err = scenario.WaitForTailscaleSync()
 	assertNoErrSync(t, err)
 
-	err = executeAndUnmarshal(
-		headscale,
-		[]string{
-			"headscale",
-			"node",
-			"list",
-			"--output",
-			"json",
-		},
-		&nodes,
-	)
+	// Wait for nodestore batch processing to complete
+	// NodeStore batching timeout is 500ms, so we wait up to 1 second
+	assert.Eventually(t, func() bool {
+		err = executeAndUnmarshal(
+			headscale,
+			[]string{
+				"headscale",
+				"node",
+				"list",
+				"--output",
+				"json",
+			},
+			&nodes,
+		)
 
-	assertNoErr(t, err)
-	assert.Len(t, nodes, 3)
+		if err != nil || len(nodes) != 3 {
+			return false
+		}
 
-	for _, node := range nodes {
-		hostname := hostnames[strconv.FormatUint(node.GetId(), 10)]
-		givenName := fmt.Sprintf("%d-givenname", node.GetId())
-		assert.Equal(t, hostname+"NEW", node.GetName())
-		assert.Equal(t, givenName, node.GetGivenName())
-	}
+		for _, node := range nodes {
+			hostname := hostnames[strconv.FormatUint(node.GetId(), 10)]
+			givenName := fmt.Sprintf("%d-givenname", node.GetId())
+			if node.GetName() != hostname+"NEW" || node.GetGivenName() != givenName {
+				return false
+			}
+		}
+		return true
+	}, time.Second, 50*time.Millisecond, "hostname updates should be reflected in node list with NEW suffix")
 }
 
 func TestExpireNode(t *testing.T) {
@@ -948,12 +970,10 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 		[]tsic.Option{},
 		hsic.WithTestName("pingallbyipmany"),
 		hsic.WithEmbeddedDERPServerOnly(),
+		hsic.WithDERPAsIP(),
 		hsic.WithTLS(),
 	)
 	assertNoErrHeadscaleEnv(t, err)
-
-	hs, err := scenario.Headscale()
-	require.NoError(t, err)
 
 	allClients, err := scenario.ListTailscaleClients()
 	assertNoErrListClients(t, err)
@@ -970,13 +990,30 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 		return x.String()
 	})
 
+	// Get headscale instance for batcher debug checks
+	headscale, err := scenario.Headscale()
+	assertNoErr(t, err)
+
+	// Initial check: all nodes should be connected to batcher
+	// Extract node IDs for validation
+	expectedNodes := make([]types.NodeID, 0, len(allClients))
+	for _, client := range allClients {
+		status := client.MustStatus()
+		nodeID, err := strconv.ParseUint(string(status.Self.ID), 10, 64)
+		assertNoErr(t, err)
+		expectedNodes = append(expectedNodes, types.NodeID(nodeID))
+	}
+	requireAllClientsOnline(t, headscale, expectedNodes, true, "all clients should be connected to batcher", 30*time.Second)
+
 	success := pingAllHelper(t, allClients, allAddrs)
 	t.Logf("%d successful pings out of %d", success, len(allClients)*len(allIps))
 
-	wg, _ := errgroup.WithContext(context.Background())
-
 	for run := range 3 {
-		t.Logf("Starting DownUpPing run %d at %s", run+1, time.Now().Format("2006-01-02T15-04-05.999999999"))
+		t.Logf("Starting DownUpPing run %d at %s", run+1, time.Now().Format(TimestampFormat))
+
+		// Create fresh errgroup with timeout for each run
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		wg, _ := errgroup.WithContext(ctx)
 
 		for _, client := range allClients {
 			c := client
@@ -989,7 +1026,10 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 		if err := wg.Wait(); err != nil {
 			t.Fatalf("failed to take down all nodes: %s", err)
 		}
-		t.Logf("All nodes taken down at %s", time.Now().Format("2006-01-02T15-04-05.999999999"))
+		t.Logf("All nodes taken down at %s", time.Now().Format(TimestampFormat))
+
+		// After taking down all nodes, verify all systems show nodes offline
+		requireAllClientsOnline(t, headscale, expectedNodes, false, fmt.Sprintf("Run %d: all nodes should be offline after Down()", run+1), 120*time.Second)
 
 		for _, client := range allClients {
 			c := client
@@ -1002,24 +1042,24 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 		if err := wg.Wait(); err != nil {
 			t.Fatalf("failed to bring up all nodes: %s", err)
 		}
-		t.Logf("All nodes brought up at %s", time.Now().Format("2006-01-02T15-04-05.999999999"))
+		t.Logf("All nodes brought up at %s", time.Now().Format(TimestampFormat))
+
+		// After bringing up all nodes, verify batcher shows all reconnected
+		requireAllClientsOnline(t, headscale, expectedNodes, true, fmt.Sprintf("Run %d: all nodes should be reconnected after Up()", run+1), 120*time.Second)
 
 		// Wait for sync and successful pings after nodes come back up
 		err = scenario.WaitForTailscaleSync()
 		assert.NoError(t, err)
 
-		t.Logf("All nodes synced up %s", time.Now().Format("2006-01-02T15-04-05.999999999"))
+		t.Logf("All nodes synced up %s", time.Now().Format(TimestampFormat))
 
-		assert.EventuallyWithT(t, func(ct *assert.CollectT) {
-			all, err := hs.GetAllMapReponses()
-			assert.NoError(ct, err)
-
-			onlineMap := buildExpectedOnlineMap(all)
-			assertExpectedOnlineMapAllOnline(ct, len(allClients)-1, onlineMap)
-		}, 60*time.Second, 2*time.Second)
+		requireAllClientsOnline(t, headscale, expectedNodes, true, fmt.Sprintf("Run %d: all systems should show nodes online after reconnection", run+1), 60*time.Second)
 
 		success := pingAllHelper(t, allClients, allAddrs)
 		assert.Equalf(t, len(allClients)*len(allIps), success, "%d successful pings out of %d", success, len(allClients)*len(allIps))
+
+		// Clean up context for this run
+		cancel()
 	}
 }
 
@@ -1131,51 +1171,158 @@ func Test2118DeletingOnlineNodePanics(t *testing.T) {
 	assert.Equal(t, nodeList[1].GetId(), nodeListAfter[0].GetId())
 }
 
-func buildExpectedOnlineMap(all map[types.NodeID][]tailcfg.MapResponse) map[types.NodeID]map[types.NodeID]bool {
-	res := make(map[types.NodeID]map[types.NodeID]bool)
-	for nid, mrs := range all {
-		res[nid] = make(map[types.NodeID]bool)
-		for _, mr := range mrs {
-			for _, peer := range mr.Peers {
-				if peer.Online != nil {
-					res[nid][types.NodeID(peer.ID)] = *peer.Online
-				}
-			}
-
-			for _, peer := range mr.PeersChanged {
-				if peer.Online != nil {
-					res[nid][types.NodeID(peer.ID)] = *peer.Online
-				}
-			}
-
-			for _, peer := range mr.PeersChangedPatch {
-				if peer.Online != nil {
-					res[nid][types.NodeID(peer.NodeID)] = *peer.Online
-				}
-			}
-		}
-	}
-	return res
+// NodeSystemStatus represents the online status of a node across different systems
+type NodeSystemStatus struct {
+	Batcher          bool
+	BatcherConnCount int
+	MapResponses     bool
+	NodeStore        bool
 }
 
-func assertExpectedOnlineMapAllOnline(t *assert.CollectT, expectedPeerCount int, onlineMap map[types.NodeID]map[types.NodeID]bool) {
-	for nid, peers := range onlineMap {
-		onlineCount := 0
-		for _, online := range peers {
-			if online {
-				onlineCount++
+// requireAllSystemsOnline checks that nodes are online/offline across batcher, mapresponses, and nodestore
+func requireAllClientsOnline(t *testing.T, headscale ControlServer, expectedNodes []types.NodeID, expectedOnline bool, message string, timeout time.Duration) {
+	t.Helper()
+
+	startTime := time.Now()
+	t.Logf("requireAllSystemsOnline: Starting validation at %s - %s", startTime.Format(TimestampFormat), message)
+
+	var prevReport string
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		// Get batcher state
+		debugInfo, err := headscale.DebugBatcher()
+		assert.NoError(c, err, "Failed to get batcher debug info")
+		if err != nil {
+			return
+		}
+
+		// Get map responses
+		mapResponses, err := headscale.GetAllMapReponses()
+		assert.NoError(c, err, "Failed to get map responses")
+		if err != nil {
+			return
+		}
+
+		// Get nodestore state
+		nodeStore, err := headscale.DebugNodeStore()
+		assert.NoError(c, err, "Failed to get nodestore debug info")
+		if err != nil {
+			return
+		}
+
+		// Validate node counts first
+		expectedCount := len(expectedNodes)
+		assert.Equal(c, expectedCount, debugInfo.TotalNodes, "Batcher total nodes mismatch")
+		assert.Equal(c, expectedCount, len(nodeStore), "NodeStore total nodes mismatch")
+
+		// Check that we have map responses for expected nodes
+		mapResponseCount := len(mapResponses)
+		assert.Equal(c, expectedCount, mapResponseCount, "MapResponses total nodes mismatch")
+
+		// Build status map for each node
+		nodeStatus := make(map[types.NodeID]NodeSystemStatus)
+
+		// Initialize all expected nodes
+		for _, nodeID := range expectedNodes {
+			nodeStatus[nodeID] = NodeSystemStatus{}
+		}
+
+		// Check batcher state
+		for nodeIDStr, nodeInfo := range debugInfo.ConnectedNodes {
+			nodeID := types.MustParseNodeID(nodeIDStr)
+			if status, exists := nodeStatus[nodeID]; exists {
+				status.Batcher = nodeInfo.Connected
+				status.BatcherConnCount = nodeInfo.ActiveConnections
+				nodeStatus[nodeID] = status
 			}
 		}
-		assert.Equalf(t, expectedPeerCount, len(peers), "node:%d had an unexpected number of peers in online map", nid)
-		if expectedPeerCount != onlineCount {
-			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("Not all of node:%d peers where online:\n", nid))
-			for pid, online := range peers {
-				sb.WriteString(fmt.Sprintf("\tPeer node:%d online: %t\n", pid, online))
+
+		// Check map responses using buildExpectedOnlineMap
+		onlineFromMaps := make(map[types.NodeID]bool)
+		onlineMap := integrationutil.BuildExpectedOnlineMap(mapResponses)
+		for nodeID := range nodeStatus {
+		NODE_STATUS:
+			for id, peerMap := range onlineMap {
+				if id == nodeID {
+					continue
+				}
+
+				online := peerMap[nodeID]
+				// If the node is offline in any map response, we consider it offline
+				if !online {
+					onlineFromMaps[nodeID] = false
+					continue NODE_STATUS
+				}
+
+				onlineFromMaps[nodeID] = true
 			}
-			sb.WriteString("timestamp: " + time.Now().Format("2006-01-02T15-04-05.999999999") + "\n")
-			sb.WriteString("expected all peers to be online.")
-			t.Errorf("%s", sb.String())
 		}
-	}
+		assert.Lenf(c, onlineFromMaps, expectedCount, "MapResponses missing nodes in status check")
+
+		// Update status with map response data
+		for nodeID, online := range onlineFromMaps {
+			if status, exists := nodeStatus[nodeID]; exists {
+				status.MapResponses = online
+				nodeStatus[nodeID] = status
+			}
+		}
+
+		// Check nodestore state
+		for nodeID, node := range nodeStore {
+			if status, exists := nodeStatus[nodeID]; exists {
+				// Check if node is online in nodestore
+				status.NodeStore = node.IsOnline != nil && *node.IsOnline
+				nodeStatus[nodeID] = status
+			}
+		}
+
+		// Verify all systems show nodes in expected state and report failures
+		allMatch := true
+		var failureReport strings.Builder
+
+		ids := types.NodeIDs(maps.Keys(nodeStatus))
+		slices.Sort(ids)
+		for _, nodeID := range ids {
+			status := nodeStatus[nodeID]
+			systemsMatch := (status.Batcher == expectedOnline) &&
+				(status.MapResponses == expectedOnline) &&
+				(status.NodeStore == expectedOnline)
+
+			if !systemsMatch {
+				allMatch = false
+				stateStr := "offline"
+				if expectedOnline {
+					stateStr = "online"
+				}
+				failureReport.WriteString(fmt.Sprintf("node:%d is not fully %s:\n", nodeID, stateStr))
+				failureReport.WriteString(fmt.Sprintf("  - batcher: %t\n", status.Batcher))
+				failureReport.WriteString(fmt.Sprintf("    - conn count: %d\n", status.BatcherConnCount))
+				failureReport.WriteString(fmt.Sprintf("  - mapresponses: %t (down with at least one peer)\n", status.MapResponses))
+				failureReport.WriteString(fmt.Sprintf("  - nodestore: %t\n", status.NodeStore))
+			}
+		}
+
+		if !allMatch {
+			if diff := cmp.Diff(prevReport, failureReport.String()); diff != "" {
+				t.Log("Diff between reports:")
+				t.Logf("Prev report: \n%s\n", prevReport)
+				t.Logf("New report: \n%s\n", failureReport.String())
+				t.Log("timestamp: " + time.Now().Format(TimestampFormat) + "\n")
+				prevReport = failureReport.String()
+			}
+
+			failureReport.WriteString("timestamp: " + time.Now().Format(TimestampFormat) + "\n")
+
+			assert.Fail(c, failureReport.String())
+		}
+
+		stateStr := "offline"
+		if expectedOnline {
+			stateStr = "online"
+		}
+		assert.True(c, allMatch, fmt.Sprintf("Not all nodes are %s across all systems", stateStr))
+	}, timeout, 2*time.Second, message)
+
+	endTime := time.Now()
+	duration := endTime.Sub(startTime)
+	t.Logf("requireAllSystemsOnline: Completed validation at %s - Duration: %v - %s", endTime.Format(TimestampFormat), duration, message)
 }

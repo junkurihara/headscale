@@ -4,7 +4,9 @@ import (
 	"net/netip"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	"github.com/juanfont/headscale/hscontrol"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
+	"github.com/juanfont/headscale/hscontrol/routes"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/ory/dockertest/v3"
 	"tailscale.com/tailcfg"
@@ -30,6 +32,10 @@ type ControlServer interface {
 	ApproveRoutes(uint64, []netip.Prefix) (*v1.Node, error)
 	GetCert() []byte
 	GetHostname() string
+	GetIPInNetwork(network *dockertest.Network) string
 	SetPolicy(*policyv2.Policy) error
 	GetAllMapReponses() (map[types.NodeID][]tailcfg.MapResponse, error)
+	PrimaryRoutes() (*routes.DebugRoutes, error)
+	DebugBatcher() (*hscontrol.DebugBatcherInfo, error)
+	DebugNodeStore() (map[types.NodeID]types.Node, error)
 }

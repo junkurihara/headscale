@@ -14,10 +14,27 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/integration/dockertestutil"
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
+	"tailscale.com/tailcfg"
 )
+
+// PeerSyncTimeout returns the timeout for peer synchronization based on environment:
+// 60s for dev, 120s for CI.
+func PeerSyncTimeout() time.Duration {
+	if util.IsCI() {
+		return 120 * time.Second
+	}
+	return 60 * time.Second
+}
+
+// PeerSyncRetryInterval returns the retry interval for peer synchronization checks.
+func PeerSyncRetryInterval() time.Duration {
+	return 100 * time.Millisecond
+}
 
 func WriteFileToContainer(
 	pool *dockertest.Pool,
@@ -182,4 +199,31 @@ func CreateCertificate(hostname string) ([]byte, []byte, error) {
 	}
 
 	return certPEM.Bytes(), certPrivKeyPEM.Bytes(), nil
+}
+
+func BuildExpectedOnlineMap(all map[types.NodeID][]tailcfg.MapResponse) map[types.NodeID]map[types.NodeID]bool {
+	res := make(map[types.NodeID]map[types.NodeID]bool)
+	for nid, mrs := range all {
+		res[nid] = make(map[types.NodeID]bool)
+		for _, mr := range mrs {
+			for _, peer := range mr.Peers {
+				if peer.Online != nil {
+					res[nid][types.NodeID(peer.ID)] = *peer.Online
+				}
+			}
+
+			for _, peer := range mr.PeersChanged {
+				if peer.Online != nil {
+					res[nid][types.NodeID(peer.ID)] = *peer.Online
+				}
+			}
+
+			for _, peer := range mr.PeersChangedPatch {
+				if peer.Online != nil {
+					res[nid][types.NodeID(peer.NodeID)] = *peer.Online
+				}
+			}
+		}
+	}
+	return res
 }
