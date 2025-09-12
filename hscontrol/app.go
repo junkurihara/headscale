@@ -100,7 +100,7 @@ type Headscale struct {
 	authProvider   AuthProvider
 	mapBatcher     mapper.Batcher
 
-	pollNetMapStreamWG sync.WaitGroup
+	clientStreamsOpen sync.WaitGroup
 }
 
 var (
@@ -129,10 +129,10 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 	}
 
 	app := Headscale{
-		cfg:                cfg,
-		noisePrivateKey:    noisePrivateKey,
-		pollNetMapStreamWG: sync.WaitGroup{},
-		state:              s,
+		cfg:               cfg,
+		noisePrivateKey:   noisePrivateKey,
+		clientStreamsOpen: sync.WaitGroup{},
+		state:             s,
 	}
 
 	// Initialize ephemeral garbage collector
@@ -511,7 +511,8 @@ func (h *Headscale) Serve() error {
 		spew.Dump(h.cfg)
 	}
 
-	log.Info().Str("version", types.Version).Str("commit", types.GitCommitHash).Msg("Starting Headscale")
+	versionInfo := types.GetVersionInfo()
+	log.Info().Str("version", versionInfo.Version).Str("commit", versionInfo.Commit).Msg("Starting Headscale")
 	log.Info().
 		Str("minimum_version", capver.TailscaleVersion(capver.MinSupportedCapabilityVersion)).
 		Msg("Clients with a lower minimum version will be rejected")
@@ -813,10 +814,11 @@ func (h *Headscale) Serve() error {
 					log.Error().Err(err).Msg("failed to shutdown http")
 				}
 
-				info("closing node notifier")
+				info("closing batcher")
+				h.mapBatcher.Close()
 
 				info("waiting for netmap stream to close")
-				h.pollNetMapStreamWG.Wait()
+				h.clientStreamsOpen.Wait()
 
 				info("shutting down grpc server (socket)")
 				grpcSocket.GracefulStop()
@@ -842,11 +844,11 @@ func (h *Headscale) Serve() error {
 				info("closing socket listener")
 				socketListener.Close()
 
-				// Close db connections
-				info("closing database connection")
+				// Close state connections
+				info("closing state and database")
 				err = h.state.Close()
 				if err != nil {
-					log.Error().Err(err).Msg("failed to close db")
+					log.Error().Err(err).Msg("failed to close state")
 				}
 
 				log.Info().
