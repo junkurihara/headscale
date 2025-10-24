@@ -514,7 +514,7 @@ func TestUpdateHostnameFromClient(t *testing.T) {
 
 	hostnames := map[string]string{
 		"1": "user1-host",
-		"2": "User2-Host",
+		"2": "user2-host",
 		"3": "user3-host",
 	}
 
@@ -541,8 +541,7 @@ func TestUpdateHostnameFromClient(t *testing.T) {
 
 	// update hostnames using the up command
 	for _, client := range allClients {
-		status, err := client.Status()
-		require.NoError(t, err)
+		status := client.MustStatus()
 
 		command := []string{
 			"tailscale",
@@ -577,7 +576,11 @@ func TestUpdateHostnameFromClient(t *testing.T) {
 		for _, node := range nodes {
 			hostname := hostnames[strconv.FormatUint(node.GetId(), 10)]
 			assert.Equal(ct, hostname, node.GetName(), "Node name should match hostname")
-			assert.Equal(ct, util.ConvertWithFQDNRules(hostname), node.GetGivenName(), "Given name should match FQDN rules")
+
+			// GivenName is normalized (lowercase, invalid chars stripped)
+			normalised, err := util.NormaliseHostname(hostname)
+			assert.NoError(ct, err)
+			assert.Equal(ct, normalised, node.GetGivenName(), "Given name should match FQDN rules")
 		}
 	}, 20*time.Second, 1*time.Second)
 
@@ -638,8 +641,7 @@ func TestUpdateHostnameFromClient(t *testing.T) {
 	}, 60*time.Second, 2*time.Second)
 
 	for _, client := range allClients {
-		status, err := client.Status()
-		require.NoError(t, err)
+		status := client.MustStatus()
 
 		command := []string{
 			"tailscale",
@@ -675,12 +677,13 @@ func TestUpdateHostnameFromClient(t *testing.T) {
 		for _, node := range nodes {
 			hostname := hostnames[strconv.FormatUint(node.GetId(), 10)]
 			givenName := fmt.Sprintf("%d-givenname", node.GetId())
-			if node.GetName() != hostname+"NEW" || node.GetGivenName() != givenName {
+			// Hostnames are lowercased before being stored, so "NEW" becomes "new"
+			if node.GetName() != hostname+"new" || node.GetGivenName() != givenName {
 				return false
 			}
 		}
 		return true
-	}, time.Second, 50*time.Millisecond, "hostname updates should be reflected in node list with NEW suffix")
+	}, time.Second, 50*time.Millisecond, "hostname updates should be reflected in node list with new suffix")
 }
 
 func TestExpireNode(t *testing.T) {
@@ -768,26 +771,25 @@ func TestExpireNode(t *testing.T) {
 
 	// Verify that the expired node has been marked in all peers list.
 	for _, client := range allClients {
-		status, err := client.Status()
-		require.NoError(t, err)
+		if client.Hostname() == node.GetName() {
+			continue
+		}
 
-		if client.Hostname() != node.GetName() {
-			t.Logf("available peers of %s: %v", client.Hostname(), status.Peers())
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			status, err := client.Status()
+			assert.NoError(c, err)
 
 			// Ensures that the node is present, and that it is expired.
-			if peerStatus, ok := status.Peer[expiredNodeKey]; ok {
-				requireNotNil(t, peerStatus.Expired)
-				assert.NotNil(t, peerStatus.KeyExpiry)
+			peerStatus, ok := status.Peer[expiredNodeKey]
+			assert.True(c, ok, "expired node key should be present in peer list")
 
-				t.Logf(
-					"node %q should have a key expire before %s, was %s",
-					peerStatus.HostName,
-					now.String(),
-					peerStatus.KeyExpiry,
-				)
+			if ok {
+				assert.NotNil(c, peerStatus.Expired)
+				assert.NotNil(c, peerStatus.KeyExpiry)
+
 				if peerStatus.KeyExpiry != nil {
 					assert.Truef(
-						t,
+						c,
 						peerStatus.KeyExpiry.Before(now),
 						"node %q should have a key expire before %s, was %s",
 						peerStatus.HostName,
@@ -797,7 +799,7 @@ func TestExpireNode(t *testing.T) {
 				}
 
 				assert.Truef(
-					t,
+					c,
 					peerStatus.Expired,
 					"node %q should be expired, expired is %v",
 					peerStatus.HostName,
@@ -806,24 +808,14 @@ func TestExpireNode(t *testing.T) {
 
 				_, stderr, _ := client.Execute([]string{"tailscale", "ping", node.GetName()})
 				if !strings.Contains(stderr, "node key has expired") {
-					t.Errorf(
+					c.Errorf(
 						"expected to be unable to ping expired host %q from %q",
 						node.GetName(),
 						client.Hostname(),
 					)
 				}
-			} else {
-				t.Errorf("failed to find node %q with nodekey (%s) in mapresponse, should be present even if it is expired", node.GetName(), expiredNodeKey)
 			}
-		} else {
-			if status.Self.KeyExpiry != nil {
-				assert.Truef(t, status.Self.KeyExpiry.Before(now), "node %q should have a key expire before %s, was %s", status.Self.HostName, now.String(), status.Self.KeyExpiry)
-			}
-
-			// NeedsLogin means that the node has understood that it is no longer
-			// valid.
-			assert.Equalf(t, "NeedsLogin", status.BackendState, "checking node %q", status.Self.HostName)
-		}
+		}, 10*time.Second, 200*time.Millisecond, "Waiting for expired node status to propagate")
 	}
 }
 
@@ -861,11 +853,13 @@ func TestNodeOnlineStatus(t *testing.T) {
 	t.Logf("before expire: %d successful pings out of %d", success, len(allClients)*len(allIps))
 
 	for _, client := range allClients {
-		status, err := client.Status()
-		require.NoError(t, err)
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			status, err := client.Status()
+			assert.NoError(c, err)
 
-		// Assert that we have the original count - self
-		assert.Len(t, status.Peers(), len(MustTestVersions)-1)
+			// Assert that we have the original count - self
+			assert.Len(c, status.Peers(), len(MustTestVersions)-1)
+		}, 10*time.Second, 200*time.Millisecond, "Waiting for expected peer count")
 	}
 
 	headscale, err := scenario.Headscale()

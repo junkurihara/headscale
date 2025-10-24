@@ -132,9 +132,10 @@ func NewState(cfg *types.Config) (*State, error) {
 		return nil, fmt.Errorf("init policy manager: %w", err)
 	}
 
+	// PolicyManager.BuildPeerMap handles both global and per-node filter complexity.
+	// This moves the complex peer relationship logic into the policy package where it belongs.
 	nodeStore := NewNodeStore(nodes, func(nodes []types.NodeView) map[types.NodeID][]types.NodeView {
-		_, matchers := polMan.Filter()
-		return policy.BuildPeerMap(views.SliceOf(nodes), matchers)
+		return polMan.BuildPeerMap(views.SliceOf(nodes))
 	})
 	nodeStore.Start()
 
@@ -224,6 +225,12 @@ func (s *State) ReloadPolicy() ([]change.ChangeSet, error) {
 	if err != nil {
 		return nil, fmt.Errorf("setting policy: %w", err)
 	}
+
+	// Rebuild peer maps after policy changes because the peersFunc in NodeStore
+	// uses the PolicyManager's filters. Without this, nodes won't see newly allowed
+	// peers until a node is added/removed, causing autogroup:self policies to not
+	// propagate correctly when switching between policy types.
+	s.nodeStore.RebuildPeerMaps()
 
 	cs := []change.ChangeSet{change.PolicyChange()}
 
@@ -662,8 +669,7 @@ func (s *State) SetApprovedRoutes(nodeID types.NodeID, routes []netip.Prefix) (t
 
 // RenameNode changes the display name of a node.
 func (s *State) RenameNode(nodeID types.NodeID, newName string) (types.NodeView, change.ChangeSet, error) {
-	// Validate the new name before making any changes
-	if err := util.CheckForFQDNRules(newName); err != nil {
+	if err := util.ValidateHostname(newName); err != nil {
 		return types.NodeView{}, change.EmptySet, fmt.Errorf("renaming node: %w", err)
 	}
 
@@ -796,6 +802,11 @@ func (s *State) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
 // FilterForNode returns filter rules for a specific node, handling autogroup:self per-node.
 func (s *State) FilterForNode(node types.NodeView) ([]tailcfg.FilterRule, error) {
 	return s.polMan.FilterForNode(node)
+}
+
+// MatchersForNode returns matchers for peer relationship determination (unreduced).
+func (s *State) MatchersForNode(node types.NodeView) ([]matcher.Match, error) {
+	return s.polMan.MatchersForNode(node)
 }
 
 // NodeCanHaveTag checks if a node is allowed to have a specific tag.
@@ -1112,12 +1123,16 @@ func (s *State) HandleNodeFromAuthPath(
 		return types.NodeView{}, change.EmptySet, fmt.Errorf("failed to find user: %w", err)
 	}
 
-	// Ensure we have valid hostinfo and hostname from the registration cache entry
-	validHostinfo, hostname := util.EnsureValidHostinfo(
+	// Ensure we have a valid hostname from the registration cache entry
+	hostname := util.EnsureHostname(
 		regEntry.Node.Hostinfo,
 		regEntry.Node.MachineKey.String(),
 		regEntry.Node.NodeKey.String(),
 	)
+
+	// Ensure we have valid hostinfo
+	validHostinfo := cmp.Or(regEntry.Node.Hostinfo, &tailcfg.Hostinfo{})
+	validHostinfo.Hostname = hostname
 
 	logHostinfoValidation(
 		regEntry.Node.MachineKey.ShortString(),
@@ -1284,12 +1299,16 @@ func (s *State) HandleNodeFromPreAuthKey(
 		return types.NodeView{}, change.EmptySet, err
 	}
 
-	// Ensure we have valid hostinfo and hostname - handle nil/empty cases
-	validHostinfo, hostname := util.EnsureValidHostinfo(
+	// Ensure we have a valid hostname - handle nil/empty cases
+	hostname := util.EnsureHostname(
 		regReq.Hostinfo,
 		machineKey.String(),
 		regReq.NodeKey.String(),
 	)
+
+	// Ensure we have valid hostinfo
+	validHostinfo := cmp.Or(regReq.Hostinfo, &tailcfg.Hostinfo{})
+	validHostinfo.Hostname = hostname
 
 	logHostinfoValidation(
 		machineKey.ShortString(),

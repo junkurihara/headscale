@@ -84,6 +84,20 @@ the code base over time and make it more correct and efficient.
   [#2692](https://github.com/juanfont/headscale/pull/2692)
 - Policy: Zero or empty destination port is no longer allowed
   [#2606](https://github.com/juanfont/headscale/pull/2606)
+- Stricter hostname validation [#2383](https://github.com/juanfont/headscale/pull/2383)
+  - Hostnames must be valid DNS labels (2-63 characters, alphanumeric and
+    hyphens only, cannot start/end with hyphen)
+  - **Client Registration (New Nodes)**: Invalid hostnames are automatically
+    renamed to `invalid-XXXXXX` format
+    - `my-laptop` → accepted as-is
+    - `My-Laptop` → `my-laptop` (lowercased)
+    - `my_laptop` → `invalid-a1b2c3` (underscore not allowed)
+    - `test@host` → `invalid-d4e5f6` (@ not allowed)
+    - `laptop-🚀` → `invalid-j1k2l3` (emoji not allowed)
+  - **Hostinfo Updates / CLI**: Invalid hostnames are rejected with an error
+    - Valid names are accepted or lowercased
+    - Names with invalid characters, too short (<2), too long (>63), or
+      starting/ending with hyphen are rejected
 
 ### Changes
 
@@ -192,7 +206,7 @@ new policy code passes all of our tests.
 - Error messages should be more descriptive and informative.
   - There is still work to be here, but it is already improved with "typing"
     (e.g. only Users can be put in Groups)
-- All users must contain an `@` character.
+- All users in the policy must contain an `@` character.
   - If your user naturally contains and `@`, like an email, this will just work.
   - If its based on usernames, or other identifiers not containing an `@`, an
     `@` should be appended at the end. For example, if your user is `john`, it
