@@ -223,6 +223,7 @@ func TestAuthKeyLogoutAndReloginNewUser(t *testing.T) {
 
 	scenario, err := NewScenario(spec)
 	require.NoError(t, err)
+
 	defer scenario.ShutdownAssertNoPanics(t)
 
 	err = scenario.CreateHeadscaleEnv([]tsic.Option{},

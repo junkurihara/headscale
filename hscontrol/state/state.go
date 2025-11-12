@@ -300,7 +300,9 @@ func (s *State) UpdateUser(userID types.UserID, updateFn func(*types.User) error
 			return nil, err
 		}
 
-		if err := tx.Save(user).Error; err != nil {
+		// Use Updates() to only update modified fields, preserving unchanged values.
+		err = tx.Updates(user).Error
+		if err != nil {
 			return nil, fmt.Errorf("updating user: %w", err)
 		}
 
@@ -386,7 +388,11 @@ func (s *State) persistNodeToDB(node types.NodeView) (types.NodeView, change.Cha
 
 	nodePtr := node.AsStruct()
 
-	if err := s.db.DB.Save(nodePtr).Error; err != nil {
+	// Use Omit("expiry") to prevent overwriting expiry during MapRequest updates.
+	// Expiry should only be updated through explicit SetNodeExpiry calls or re-registration.
+	// See: https://github.com/juanfont/headscale/issues/2862
+	err := s.db.DB.Omit("expiry").Updates(nodePtr).Error
+	if err != nil {
 		return types.NodeView{}, change.EmptySet, fmt.Errorf("saving node: %w", err)
 	}
 
@@ -423,6 +429,8 @@ func (s *State) DeleteNode(node types.NodeView) (change.ChangeSet, error) {
 		return change.EmptySet, err
 	}
 
+	s.ipAlloc.FreeIPs(node.IPs())
+
 	c := change.NodeRemoved(node.ID())
 
 	// Check if policy manager needs updating after node deletion
@@ -456,9 +464,9 @@ func (s *State) Connect(id types.NodeID) []change.ChangeSet {
 	log.Info().Uint64("node.id", id.Uint64()).Str("node.name", node.Hostname()).Msg("Node connected")
 
 	// Use the node's current routes for primary route update
-	// SubnetRoutes() returns only the intersection of announced AND approved routes
-	// We MUST use SubnetRoutes() to maintain the security model
-	routeChange := s.primaryRoutes.SetRoutes(id, node.SubnetRoutes()...)
+	// AllApprovedRoutes() returns only the intersection of announced AND approved routes
+	// We MUST use AllApprovedRoutes() to maintain the security model
+	routeChange := s.primaryRoutes.SetRoutes(id, node.AllApprovedRoutes()...)
 
 	if routeChange {
 		c = append(c, change.NodeAdded(id))
@@ -656,7 +664,7 @@ func (s *State) SetApprovedRoutes(nodeID types.NodeID, routes []netip.Prefix) (t
 	// Update primary routes table based on SubnetRoutes (intersection of announced and approved).
 	// The primary routes table is what the mapper uses to generate network maps, so updating it
 	// here ensures that route changes are distributed to peers.
-	routeChange := s.primaryRoutes.SetRoutes(nodeID, nodeView.SubnetRoutes()...)
+	routeChange := s.primaryRoutes.SetRoutes(nodeID, nodeView.AllApprovedRoutes()...)
 
 	// If routes changed or the changeset isn't already a full update, trigger a policy change
 	// to ensure all nodes get updated network maps
@@ -1187,9 +1195,10 @@ func (s *State) HandleNodeFromAuthPath(
 			return types.NodeView{}, change.EmptySet, fmt.Errorf("node not found in NodeStore: %d", existingNodeSameUser.ID())
 		}
 
-		// Use the node from UpdateNode to save to database
 		_, err = hsdb.Write(s.db.DB, func(tx *gorm.DB) (*types.Node, error) {
-			if err := tx.Save(updatedNodeView.AsStruct()).Error; err != nil {
+			// Use Updates() to preserve fields not modified by UpdateNode.
+			err := tx.Updates(updatedNodeView.AsStruct()).Error
+			if err != nil {
 				return nil, fmt.Errorf("failed to save node: %w", err)
 			}
 			return nil, nil
@@ -1294,9 +1303,46 @@ func (s *State) HandleNodeFromPreAuthKey(
 		return types.NodeView{}, change.EmptySet, err
 	}
 
-	err = pak.Validate()
-	if err != nil {
-		return types.NodeView{}, change.EmptySet, err
+	// Check if node exists with same machine key before validating the key.
+	// For #2830: container restarts send the same pre-auth key which may be used/expired.
+	// Skip validation for existing nodes re-registering with the same NodeKey, as the
+	// key was only needed for initial authentication. NodeKey rotation requires validation.
+	existingNodeSameUser, existsSameUser := s.nodeStore.GetNodeByMachineKey(machineKey, types.UserID(pak.User.ID))
+
+	// Skip validation only if both the AuthKeyID and NodeKey match (not a rotation).
+	isExistingNodeReregistering := existsSameUser && existingNodeSameUser.Valid() &&
+		existingNodeSameUser.AuthKey().Valid() &&
+		existingNodeSameUser.AuthKeyID().Valid() &&
+		existingNodeSameUser.AuthKeyID().Get() == pak.ID
+
+	// Check if this is a NodeKey rotation (different NodeKey)
+	isNodeKeyRotation := existsSameUser && existingNodeSameUser.Valid() &&
+		existingNodeSameUser.NodeKey() != regReq.NodeKey
+
+	if isExistingNodeReregistering && !isNodeKeyRotation {
+		// Existing node re-registering with same NodeKey: skip validation.
+		// Pre-auth keys are only needed for initial authentication. Critical for
+		// containers that run "tailscale up --authkey=KEY" on every restart.
+		log.Debug().
+			Caller().
+			Uint64("node.id", existingNodeSameUser.ID().Uint64()).
+			Str("node.name", existingNodeSameUser.Hostname()).
+			Str("machine.key", machineKey.ShortString()).
+			Str("node.key.existing", existingNodeSameUser.NodeKey().ShortString()).
+			Str("node.key.request", regReq.NodeKey.ShortString()).
+			Uint64("authkey.id", pak.ID).
+			Bool("authkey.used", pak.Used).
+			Bool("authkey.expired", pak.Expiration != nil && pak.Expiration.Before(time.Now())).
+			Bool("authkey.reusable", pak.Reusable).
+			Bool("nodekey.rotation", isNodeKeyRotation).
+			Msg("Existing node re-registering with same NodeKey and auth key, skipping validation")
+
+	} else {
+		// New node or NodeKey rotation: require valid auth key.
+		err = pak.Validate()
+		if err != nil {
+			return types.NodeView{}, change.EmptySet, err
+		}
 	}
 
 	// Ensure we have a valid hostname - handle nil/empty cases
@@ -1327,9 +1373,6 @@ func (s *State) HandleNodeFromPreAuthKey(
 		Msg("Registering node with pre-auth key")
 
 	var finalNode types.NodeView
-
-	// Check if node already exists with same machine key for this user
-	existingNodeSameUser, existsSameUser := s.nodeStore.GetNodeByMachineKey(machineKey, types.UserID(pak.User.ID))
 
 	// If this node exists for this user, update the node in place.
 	if existsSameUser && existingNodeSameUser.Valid() {
@@ -1372,9 +1415,10 @@ func (s *State) HandleNodeFromPreAuthKey(
 			return types.NodeView{}, change.EmptySet, fmt.Errorf("node not found in NodeStore: %d", existingNodeSameUser.ID())
 		}
 
-		// Use the node from UpdateNode to save to database
 		_, err = hsdb.Write(s.db.DB, func(tx *gorm.DB) (*types.Node, error) {
-			if err := tx.Save(updatedNodeView.AsStruct()).Error; err != nil {
+			// Use Updates() to preserve fields not modified by UpdateNode.
+			err := tx.Updates(updatedNodeView.AsStruct()).Error
+			if err != nil {
 				return nil, fmt.Errorf("failed to save node: %w", err)
 			}
 
@@ -1711,7 +1755,7 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 	}
 
 	if needsRouteUpdate {
-		// SetNodeRoutes sets the active/distributed routes, so we must use SubnetRoutes()
+		// SetNodeRoutes sets the active/distributed routes, so we must use AllApprovedRoutes()
 		// which returns only the intersection of announced AND approved routes.
 		// Using AnnouncedRoutes() would bypass the security model and auto-approve everything.
 		log.Debug().
@@ -1719,9 +1763,9 @@ func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest
 			Uint64("node.id", id.Uint64()).
 			Strs("announcedRoutes", util.PrefixesToString(updatedNode.AnnouncedRoutes())).
 			Strs("approvedRoutes", util.PrefixesToString(updatedNode.ApprovedRoutes().AsSlice())).
-			Strs("subnetRoutes", util.PrefixesToString(updatedNode.SubnetRoutes())).
+			Strs("allApprovedRoutes", util.PrefixesToString(updatedNode.AllApprovedRoutes())).
 			Msg("updating node routes for distribution")
-		nodeRouteChange = s.SetNodeRoutes(id, updatedNode.SubnetRoutes()...)
+		nodeRouteChange = s.SetNodeRoutes(id, updatedNode.AllApprovedRoutes()...)
 	}
 
 	_, policyChange, err := s.persistNodeToDB(updatedNode)

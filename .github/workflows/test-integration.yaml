@@ -38,7 +38,9 @@ jobs:
           - TestOIDCAuthenticationWithPKCE
           - TestOIDCReloginSameNodeNewUser
           - TestOIDCFollowUpUrl
+          - TestOIDCMultipleOpenedLoginUrls
           - TestOIDCReloginSameNodeSameUser
+          - TestOIDCExpiryAfterRestart
           - TestAuthWebFlowAuthenticationPingAll
           - TestAuthWebFlowLogoutAndReloginSameUser
           - TestAuthWebFlowLogoutAndReloginNewUser
@@ -70,6 +72,7 @@ jobs:
           - TestTaildrop
           - TestUpdateHostnameFromClient
           - TestExpireNode
+          - TestSetNodeExpiryInFuture
           - TestNodeOnlineStatus
           - TestPingAllByIPManyUpDown
           - Test2118DeletingOnlineNodePanics
