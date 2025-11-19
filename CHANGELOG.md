@@ -44,6 +44,10 @@ release.
 - Add bcrypt hashing for pre-authentication keys [#2853](https://github.com/juanfont/headscale/pull/2853)
 - Add structured prefix format for API keys (`hskey-api-{prefix}-{secret}`) [#2853](https://github.com/juanfont/headscale/pull/2853)
 - Add registration keys for web authentication tracking (`hskey-reg-{random}`) [#2853](https://github.com/juanfont/headscale/pull/2853)
+- Send lightweight endpoint and DERP region updates instead of full maps [#2856](https://github.com/juanfont/headscale/pull/2856)
+  - Detect when only node endpoints or DERP region changed and send
+    PeerChangedPatch responses instead of full map updates, reducing bandwidth
+    and improving performance
 
 ## 0.27.1 (2025-11-11)
 
@@ -995,7 +999,7 @@ behaviour.
 - Add IPv6 support to the prefix assigned to namespaces
 - Add API Key support
   - Enable remote control of `headscale` via CLI
-    [docs](./docs/ref/remote-cli.md)
+    [docs](./docs/ref/api.md#grpc)
   - Enable HTTP API (beta, subject to change)
 - OpenID Connect users will be mapped per namespaces
   - Each user will get its own namespace, created if it does not exist
