@@ -24,6 +24,8 @@ type ControlServer interface {
 	WaitForRunning() error
 	CreateUser(user string) (*v1.User, error)
 	CreateAuthKey(user uint64, reusable bool, ephemeral bool) (*v1.PreAuthKey, error)
+	CreateAuthKeyWithTags(user uint64, reusable bool, ephemeral bool, tags []string) (*v1.PreAuthKey, error)
+	DeleteAuthKey(user uint64, key string) error
 	ListNodes(users ...string) ([]*v1.Node, error)
 	DeleteNode(nodeID uint64) error
 	NodesByUser() (map[string][]*v1.Node, error)
@@ -31,6 +33,7 @@ type ControlServer interface {
 	ListUsers() ([]*v1.User, error)
 	MapUsers() (map[string]*v1.User, error)
 	ApproveRoutes(uint64, []netip.Prefix) (*v1.Node, error)
+	SetNodeTags(nodeID uint64, tags []string) error
 	GetCert() []byte
 	GetHostname() string
 	GetIPInNetwork(network *dockertest.Network) string

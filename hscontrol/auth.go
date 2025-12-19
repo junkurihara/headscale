@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
@@ -234,11 +233,7 @@ func isAuthKey(req tailcfg.RegisterRequest) bool {
 }
 
 func nodeToRegisterResponse(node types.NodeView) *tailcfg.RegisterResponse {
-	return &tailcfg.RegisterResponse{
-		// TODO(kradalby): Only send for user-owned nodes
-		// and not tagged nodes when tags is working.
-		User:           node.UserView().TailscaleUser(),
-		Login:          node.UserView().TailscaleLogin(),
+	resp := &tailcfg.RegisterResponse{
 		NodeKeyExpired: node.IsExpired(),
 
 		// Headscale does not implement the concept of machine authorization
@@ -246,6 +241,18 @@ func nodeToRegisterResponse(node types.NodeView) *tailcfg.RegisterResponse {
 		// Revisit this if #2176 gets implemented.
 		MachineAuthorized: true,
 	}
+
+	// For tagged nodes, use the TaggedDevices special user
+	// For user-owned nodes, include User and Login information from the actual user
+	if node.IsTagged() {
+		resp.User = types.TaggedDevices.View().TailscaleUser()
+		resp.Login = types.TaggedDevices.View().TailscaleLogin()
+	} else if node.UserView().Valid() {
+		resp.User = node.UserView().TailscaleUser()
+		resp.Login = node.UserView().TailscaleLogin()
+	}
+
+	return resp
 }
 
 func (h *Headscale) waitForFollowup(
@@ -364,16 +371,13 @@ func (h *Headscale) handleRegisterWithAuthKey(
 	// eventbus.
 	// TODO(kradalby): This needs to be ran as part of the batcher maybe?
 	// now since we dont update the node/pol here anymore
-	routeChange := h.state.AutoApproveRoutes(node)
-
-	if _, _, err := h.state.SaveNode(node); err != nil {
-		return nil, fmt.Errorf("saving auto approved routes to node: %w", err)
+	routesChange, err := h.state.AutoApproveRoutes(node)
+	if err != nil {
+		return nil, fmt.Errorf("auto approving routes: %w", err)
 	}
 
-	if routeChange && changed.Empty() {
-		changed = change.NodeAdded(node.ID())
-	}
-	h.Change(changed)
+	// Send both changes. Empty changes are ignored by Change().
+	h.Change(changed, routesChange)
 
 	// TODO(kradalby): I think this is covered above, but we need to validate that.
 	// // If policy changed due to node registration, send a separate policy change

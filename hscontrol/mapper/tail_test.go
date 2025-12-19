@@ -8,13 +8,12 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/routes"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/stretchr/testify/require"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/types/ptr"
 )
 
 func TestTailNode(t *testing.T) {
@@ -70,7 +69,6 @@ func TestTailNode(t *testing.T) {
 				HomeDERP:          0,
 				LegacyDERPString:  "127.3.3.40:0",
 				Hostinfo:          hiview(tailcfg.Hostinfo{}),
-				Tags:              []string{},
 				MachineAuthorized: true,
 
 				CapMap: tailcfg.NodeCapMap{
@@ -97,14 +95,14 @@ func TestTailNode(t *testing.T) {
 				IPv4:      iap("100.64.0.1"),
 				Hostname:  "mini",
 				GivenName: "mini",
-				UserID:    0,
-				User: types.User{
+				UserID:    ptr.To(uint(0)),
+				User: &types.User{
 					Name: "mini",
 				},
-				ForcedTags: []string{},
-				AuthKey:    &types.PreAuthKey{},
-				LastSeen:   &lastSeen,
-				Expiry:     &expire,
+				Tags:     []string{},
+				AuthKey:  &types.PreAuthKey{},
+				LastSeen: &lastSeen,
+				Expiry:   &expire,
 				Hostinfo: &tailcfg.Hostinfo{
 					RoutableIPs: []netip.Prefix{
 						tsaddr.AllIPv4(),
@@ -185,7 +183,6 @@ func TestTailNode(t *testing.T) {
 				HomeDERP:          0,
 				LegacyDERPString:  "127.3.3.40:0",
 				Hostinfo:          hiview(tailcfg.Hostinfo{}),
-				Tags:              []string{},
 				MachineAuthorized: true,
 
 				CapMap: tailcfg.NodeCapMap{
@@ -203,23 +200,20 @@ func TestTailNode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			polMan, err := policy.NewPolicyManager(tt.pol, []types.User{}, types.Nodes{tt.node}.ViewSlice())
-			require.NoError(t, err)
 			primary := routes.New()
 			cfg := &types.Config{
 				BaseDomain:          tt.baseDomain,
 				TailcfgDNSConfig:    tt.dnsConfig,
 				RandomizeClientPort: false,
+				Taildrop:            types.TaildropConfig{Enabled: true},
 			}
 			_ = primary.SetRoutes(tt.node.ID, tt.node.SubnetRoutes()...)
 
 			// This is a hack to avoid having a second node to test the primary route.
 			// This should be baked into the test case proper if it is extended in the future.
 			_ = primary.SetRoutes(2, netip.MustParsePrefix("192.168.0.0/24"))
-			got, err := tailNode(
-				tt.node.View(),
+			got, err := tt.node.View().TailNode(
 				0,
-				polMan,
 				func(id types.NodeID) []netip.Prefix {
 					return primary.PrimaryRoutes(id)
 				},
@@ -227,13 +221,13 @@ func TestTailNode(t *testing.T) {
 			)
 
 			if (err != nil) != tt.wantErr {
-				t.Errorf("tailNode() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("TailNode() error = %v, wantErr %v", err, tt.wantErr)
 
 				return
 			}
 
 			if diff := cmp.Diff(tt.want, got, cmpopts.EquateEmpty()); diff != "" {
-				t.Errorf("tailNode() unexpected result (-want +got):\n%s", diff)
+				t.Errorf("TailNode() unexpected result (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -273,17 +267,13 @@ func TestNodeExpiry(t *testing.T) {
 				GivenName: "test",
 				Expiry:    tt.exp,
 			}
-			polMan, err := policy.NewPolicyManager(nil, nil, types.Nodes{}.ViewSlice())
-			require.NoError(t, err)
 
-			tn, err := tailNode(
-				node.View(),
+			tn, err := node.View().TailNode(
 				0,
-				polMan,
 				func(id types.NodeID) []netip.Prefix {
 					return []netip.Prefix{}
 				},
-				&types.Config{},
+				&types.Config{Taildrop: types.TaildropConfig{Enabled: true}},
 			)
 			if err != nil {
 				t.Fatalf("nodeExpiry() error = %v", err)

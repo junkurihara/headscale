@@ -6,7 +6,9 @@ import (
 	"math/big"
 	"net/netip"
 	"regexp"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -83,7 +85,7 @@ func (s *Suite) TestExpireNode(c *check.C) {
 	user, err := db.CreateUser(types.User{Name: "test"})
 	c.Assert(err, check.IsNil)
 
-	pak, err := db.CreatePreAuthKey(types.UserID(user.ID), false, false, nil, nil)
+	pak, err := db.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
 	c.Assert(err, check.IsNil)
 
 	_, err = db.getNode(types.UserID(user.ID), "testnode")
@@ -97,7 +99,7 @@ func (s *Suite) TestExpireNode(c *check.C) {
 		MachineKey:     machineKey.Public(),
 		NodeKey:        nodeKey.Public(),
 		Hostname:       "testnode",
-		UserID:         user.ID,
+		UserID:         &user.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 		AuthKeyID:      ptr.To(pak.ID),
 		Expiry:         &time.Time{},
@@ -124,7 +126,7 @@ func (s *Suite) TestSetTags(c *check.C) {
 	user, err := db.CreateUser(types.User{Name: "test"})
 	c.Assert(err, check.IsNil)
 
-	pak, err := db.CreatePreAuthKey(types.UserID(user.ID), false, false, nil, nil)
+	pak, err := db.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
 	c.Assert(err, check.IsNil)
 
 	_, err = db.getNode(types.UserID(user.ID), "testnode")
@@ -138,7 +140,7 @@ func (s *Suite) TestSetTags(c *check.C) {
 		MachineKey:     machineKey.Public(),
 		NodeKey:        nodeKey.Public(),
 		Hostname:       "testnode",
-		UserID:         user.ID,
+		UserID:         &user.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 		AuthKeyID:      ptr.To(pak.ID),
 	}
@@ -152,7 +154,7 @@ func (s *Suite) TestSetTags(c *check.C) {
 	c.Assert(err, check.IsNil)
 	node, err = db.getNode(types.UserID(user.ID), "testnode")
 	c.Assert(err, check.IsNil)
-	c.Assert(node.ForcedTags, check.DeepEquals, sTags)
+	c.Assert(node.Tags, check.DeepEquals, sTags)
 
 	// assign duplicate tags, expect no errors but no doubles in DB
 	eTags := []string{"tag:bar", "tag:test", "tag:unknown", "tag:test"}
@@ -161,17 +163,10 @@ func (s *Suite) TestSetTags(c *check.C) {
 	node, err = db.getNode(types.UserID(user.ID), "testnode")
 	c.Assert(err, check.IsNil)
 	c.Assert(
-		node.ForcedTags,
+		node.Tags,
 		check.DeepEquals,
 		[]string{"tag:bar", "tag:test", "tag:unknown"},
 	)
-
-	// test removing tags
-	err = db.SetTags(node.ID, []string{})
-	c.Assert(err, check.IsNil)
-	node, err = db.getNode(types.UserID(user.ID), "testnode")
-	c.Assert(err, check.IsNil)
-	c.Assert(node.ForcedTags, check.DeepEquals, []string{})
 }
 
 func TestHeadscale_generateGivenName(t *testing.T) {
@@ -430,7 +425,7 @@ func TestAutoApproveRoutes(t *testing.T) {
 					MachineKey:     key.NewMachine().Public(),
 					NodeKey:        key.NewNode().Public(),
 					Hostname:       "testnode",
-					UserID:         user.ID,
+					UserID:         &user.ID,
 					RegisterMethod: util.RegisterMethodAuthKey,
 					Hostinfo: &tailcfg.Hostinfo{
 						RoutableIPs: tt.routes,
@@ -446,13 +441,13 @@ func TestAutoApproveRoutes(t *testing.T) {
 					MachineKey:     key.NewMachine().Public(),
 					NodeKey:        key.NewNode().Public(),
 					Hostname:       "taggednode",
-					UserID:         taggedUser.ID,
+					UserID:         &taggedUser.ID,
 					RegisterMethod: util.RegisterMethodAuthKey,
 					Hostinfo: &tailcfg.Hostinfo{
 						RoutableIPs: tt.routes,
 					},
-					ForcedTags: []string{"tag:exit"},
-					IPv4:       ptr.To(netip.MustParseAddr("100.64.0.2")),
+					Tags: []string{"tag:exit"},
+					IPv4: ptr.To(netip.MustParseAddr("100.64.0.2")),
 				}
 
 				err = adb.DB.Save(&nodeTagged).Error
@@ -514,23 +509,48 @@ func TestEphemeralGarbageCollectorOrder(t *testing.T) {
 	got := []types.NodeID{}
 	var mu sync.Mutex
 
+	deletionCount := make(chan struct{}, 10)
+
 	e := NewEphemeralGarbageCollector(func(ni types.NodeID) {
 		mu.Lock()
 		defer mu.Unlock()
 		got = append(got, ni)
+
+		deletionCount <- struct{}{}
 	})
 	go e.Start()
 
-	go e.Schedule(1, 1*time.Second)
-	go e.Schedule(2, 2*time.Second)
-	go e.Schedule(3, 3*time.Second)
-	go e.Schedule(4, 4*time.Second)
+	// Use shorter timeouts for faster tests
+	go e.Schedule(1, 50*time.Millisecond)
+	go e.Schedule(2, 100*time.Millisecond)
+	go e.Schedule(3, 150*time.Millisecond)
+	go e.Schedule(4, 200*time.Millisecond)
 
-	time.Sleep(time.Second)
+	// Wait for first deletion (node 1 at 50ms)
+	select {
+	case <-deletionCount:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for first deletion")
+	}
+
+	// Cancel nodes 2 and 4
 	go e.Cancel(2)
 	go e.Cancel(4)
 
-	time.Sleep(6 * time.Second)
+	// Wait for node 3 to be deleted (at 150ms)
+	select {
+	case <-deletionCount:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for second deletion")
+	}
+
+	// Give a bit more time for any unexpected deletions
+	select {
+	case <-deletionCount:
+		// Unexpected - more deletions than expected
+	case <-time.After(300 * time.Millisecond):
+		// Expected - no more deletions
+	}
 
 	e.Close()
 
@@ -548,20 +568,30 @@ func TestEphemeralGarbageCollectorLoads(t *testing.T) {
 
 	want := 1000
 
+	var deletedCount int64
+
 	e := NewEphemeralGarbageCollector(func(ni types.NodeID) {
 		mu.Lock()
 		defer mu.Unlock()
 
-		time.Sleep(time.Duration(generateRandomNumber(t, 3)) * time.Millisecond)
+		// Yield to other goroutines to introduce variability
+		runtime.Gosched()
 		got = append(got, ni)
+
+		atomic.AddInt64(&deletedCount, 1)
 	})
 	go e.Start()
 
+	// Use shorter expiry for faster tests
 	for i := range want {
-		go e.Schedule(types.NodeID(i), 1*time.Second)
+		go e.Schedule(types.NodeID(i), 100*time.Millisecond) //nolint:gosec // test code, no overflow risk
 	}
 
-	time.Sleep(10 * time.Second)
+	// Wait for all deletions to complete
+	assert.EventuallyWithT(t, func(c *assert.CollectT) {
+		count := atomic.LoadInt64(&deletedCount)
+		assert.Equal(c, int64(want), count, "all nodes should be deleted")
+	}, 10*time.Second, 50*time.Millisecond, "waiting for all deletions")
 
 	e.Close()
 
@@ -593,10 +623,10 @@ func TestListEphemeralNodes(t *testing.T) {
 	user, err := db.CreateUser(types.User{Name: "test"})
 	require.NoError(t, err)
 
-	pak, err := db.CreatePreAuthKey(types.UserID(user.ID), false, false, nil, nil)
+	pak, err := db.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
 	require.NoError(t, err)
 
-	pakEph, err := db.CreatePreAuthKey(types.UserID(user.ID), false, true, nil, nil)
+	pakEph, err := db.CreatePreAuthKey(user.TypedID(), false, true, nil, nil)
 	require.NoError(t, err)
 
 	node := types.Node{
@@ -604,7 +634,7 @@ func TestListEphemeralNodes(t *testing.T) {
 		MachineKey:     key.NewMachine().Public(),
 		NodeKey:        key.NewNode().Public(),
 		Hostname:       "test",
-		UserID:         user.ID,
+		UserID:         &user.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 		AuthKeyID:      ptr.To(pak.ID),
 	}
@@ -614,7 +644,7 @@ func TestListEphemeralNodes(t *testing.T) {
 		MachineKey:     key.NewMachine().Public(),
 		NodeKey:        key.NewNode().Public(),
 		Hostname:       "ephemeral",
-		UserID:         user.ID,
+		UserID:         &user.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 		AuthKeyID:      ptr.To(pakEph.ID),
 	}
@@ -657,7 +687,7 @@ func TestNodeNaming(t *testing.T) {
 		MachineKey:     key.NewMachine().Public(),
 		NodeKey:        key.NewNode().Public(),
 		Hostname:       "test",
-		UserID:         user.ID,
+		UserID:         &user.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 		Hostinfo:       &tailcfg.Hostinfo{},
 	}
@@ -667,7 +697,7 @@ func TestNodeNaming(t *testing.T) {
 		MachineKey:     key.NewMachine().Public(),
 		NodeKey:        key.NewNode().Public(),
 		Hostname:       "test",
-		UserID:         user2.ID,
+		UserID:         &user2.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 		Hostinfo:       &tailcfg.Hostinfo{},
 	}
@@ -680,7 +710,7 @@ func TestNodeNaming(t *testing.T) {
 		MachineKey:     key.NewMachine().Public(),
 		NodeKey:        key.NewNode().Public(),
 		Hostname:       "我的电脑",
-		UserID:         user2.ID,
+		UserID:         &user2.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 	}
 
@@ -688,7 +718,7 @@ func TestNodeNaming(t *testing.T) {
 		MachineKey:     key.NewMachine().Public(),
 		NodeKey:        key.NewNode().Public(),
 		Hostname:       "a",
-		UserID:         user2.ID,
+		UserID:         &user2.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 	}
 
@@ -808,7 +838,7 @@ func TestRenameNodeComprehensive(t *testing.T) {
 		MachineKey:     key.NewMachine().Public(),
 		NodeKey:        key.NewNode().Public(),
 		Hostname:       "testnode",
-		UserID:         user.ID,
+		UserID:         &user.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 		Hostinfo:       &tailcfg.Hostinfo{},
 	}
@@ -931,7 +961,7 @@ func TestListPeers(t *testing.T) {
 		MachineKey:     key.NewMachine().Public(),
 		NodeKey:        key.NewNode().Public(),
 		Hostname:       "test1",
-		UserID:         user.ID,
+		UserID:         &user.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 		Hostinfo:       &tailcfg.Hostinfo{},
 	}
@@ -941,7 +971,7 @@ func TestListPeers(t *testing.T) {
 		MachineKey:     key.NewMachine().Public(),
 		NodeKey:        key.NewNode().Public(),
 		Hostname:       "test2",
-		UserID:         user2.ID,
+		UserID:         &user2.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 		Hostinfo:       &tailcfg.Hostinfo{},
 	}
@@ -1016,7 +1046,7 @@ func TestListNodes(t *testing.T) {
 		MachineKey:     key.NewMachine().Public(),
 		NodeKey:        key.NewNode().Public(),
 		Hostname:       "test1",
-		UserID:         user.ID,
+		UserID:         &user.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 		Hostinfo:       &tailcfg.Hostinfo{},
 	}
@@ -1026,7 +1056,7 @@ func TestListNodes(t *testing.T) {
 		MachineKey:     key.NewMachine().Public(),
 		NodeKey:        key.NewNode().Public(),
 		Hostname:       "test2",
-		UserID:         user2.ID,
+		UserID:         &user2.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 		Hostinfo:       &tailcfg.Hostinfo{},
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
+	"tailscale.com/types/ptr"
 )
 
 func TestNodeCanApproveRoute(t *testing.T) {
@@ -24,34 +25,34 @@ func TestNodeCanApproveRoute(t *testing.T) {
 		ID:       1,
 		Hostname: "user1-device",
 		IPv4:     ap("100.64.0.1"),
-		UserID:   1,
-		User:     users[0],
+		UserID:   ptr.To(uint(1)),
+		User:     ptr.To(users[0]),
 	}
 
 	exitNode := types.Node{
 		ID:       2,
 		Hostname: "user2-device",
 		IPv4:     ap("100.64.0.2"),
-		UserID:   2,
-		User:     users[1],
+		UserID:   ptr.To(uint(2)),
+		User:     ptr.To(users[1]),
 	}
 
 	taggedNode := types.Node{
-		ID:         3,
-		Hostname:   "tagged-server",
-		IPv4:       ap("100.64.0.3"),
-		UserID:     3,
-		User:       users[2],
-		ForcedTags: []string{"tag:router"},
+		ID:       3,
+		Hostname: "tagged-server",
+		IPv4:     ap("100.64.0.3"),
+		UserID:   ptr.To(uint(3)),
+		User:     ptr.To(users[2]),
+		Tags:     []string{"tag:router"},
 	}
 
 	multiTagNode := types.Node{
-		ID:         4,
-		Hostname:   "multi-tag-node",
-		IPv4:       ap("100.64.0.4"),
-		UserID:     2,
-		User:       users[1],
-		ForcedTags: []string{"tag:router", "tag:server"},
+		ID:       4,
+		Hostname: "multi-tag-node",
+		IPv4:     ap("100.64.0.4"),
+		UserID:   ptr.To(uint(2)),
+		User:     ptr.To(users[1]),
+		Tags:     []string{"tag:router", "tag:server"},
 	}
 
 	tests := []struct {
@@ -746,6 +747,32 @@ func TestNodeCanApproveRoute(t *testing.T) {
 				}
 			}`,
 			canApprove: true,
+		},
+		{
+			// Tags-as-identity: Tagged nodes are identified by their tags, not by the
+			// user who created them. Group membership of the creator is irrelevant.
+			// A tagged node can only be auto-approved via tag-based autoApprovers,
+			// not group-based ones (even if the creator is in the group).
+			name:  "tagged-node-with-group-autoapprover-not-approved",
+			node:  taggedNode, // Has tag:router, owned by user3
+			route: p("10.30.0.0/16"),
+			policy: `{
+				"tagOwners": {
+					"tag:router": ["user3@"]
+				},
+				"groups": {
+					"group:ops": ["user3@"]
+				},
+				"acls": [
+					{"action": "accept", "src": ["*"], "dst": ["*:*"]}
+				],
+				"autoApprovers": {
+					"routes": {
+						"10.30.0.0/16": ["group:ops"]
+					}
+				}
+			}`,
+			canApprove: false, // Tagged nodes don't inherit group membership for auto-approval
 		},
 		{
 			name:  "small-subnet-with-exitnode-only-approval",

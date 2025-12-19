@@ -6,7 +6,6 @@ import (
 	"net/netip"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -28,9 +27,15 @@ var (
 	ErrHostnameTooLong      = errors.New("hostname too long, cannot except 255 ASCII chars")
 	ErrNodeHasNoGivenName   = errors.New("node has no given name")
 	ErrNodeUserHasNoName    = errors.New("node user has no name")
+	ErrCannotRemoveAllTags  = errors.New("cannot remove all tags from node")
+	ErrInvalidNodeView      = errors.New("cannot convert invalid NodeView to tailcfg.Node")
 
 	invalidDNSRegex = regexp.MustCompile("[^a-z0-9-.]+")
 )
+
+// RouteFunc is a function that takes a node ID and returns a list of
+// netip.Prefixes representing the primary routes for that node.
+type RouteFunc func(id NodeID) []netip.Prefix
 
 type (
 	NodeID  uint64
@@ -97,16 +102,21 @@ type Node struct {
 	// GivenName is the name used in all DNS related
 	// parts of headscale.
 	GivenName string `gorm:"type:varchar(63);unique_index"`
-	UserID    uint
-	User      User `gorm:"constraint:OnDelete:CASCADE;"`
+
+	// UserID is set for ALL nodes (tagged and user-owned) to track "created by".
+	// For tagged nodes, this is informational only - the tag is the owner.
+	// For user-owned nodes, this identifies the owner.
+	// Only nil for orphaned nodes (should not happen in normal operation).
+	UserID *uint
+	User   *User `gorm:"constraint:OnDelete:CASCADE;"`
 
 	RegisterMethod string
 
-	// ForcedTags are tags set by CLI/API. It is not considered
-	// the source of truth, but is one of the sources from
-	// which a tag might originate.
-	// ForcedTags are _always_ applied to the node.
-	ForcedTags []string `gorm:"column:forced_tags;serializer:json"`
+	// Tags is the definitive owner for tagged nodes.
+	// When non-empty, the node is "tagged" and tags define its identity.
+	// Empty for user-owned nodes.
+	// Tags cannot be removed once set (one-way transition).
+	Tags []string `gorm:"column:tags;serializer:json"`
 
 	// When a node has been created with a PreAuthKey, we need to
 	// prevent the preauthkey from being deleted before the node.
@@ -196,55 +206,32 @@ func (node *Node) HasIP(i netip.Addr) bool {
 	return false
 }
 
-// IsTagged reports if a device is tagged
-// and therefore should not be treated as a
-// user owned device.
-// Currently, this function only handles tags set
-// via CLI ("forced tags" and preauthkeys).
+// IsTagged reports if a device is tagged and therefore should not be treated
+// as a user-owned device.
+// When a node has tags, the tags define its identity (not the user).
 func (node *Node) IsTagged() bool {
-	if len(node.ForcedTags) > 0 {
-		return true
-	}
+	return len(node.Tags) > 0
+}
 
-	if node.AuthKey != nil && len(node.AuthKey.Tags) > 0 {
-		return true
-	}
-
-	if node.Hostinfo == nil {
-		return false
-	}
-
-	// TODO(kradalby): Figure out how tagging should work
-	// and hostinfo.requestedtags.
-	// Do this in other work.
-
-	return false
+// IsUserOwned returns true if node is owned by a user (not tagged).
+// Tagged nodes may have a UserID for "created by" tracking, but the tag is the owner.
+func (node *Node) IsUserOwned() bool {
+	return !node.IsTagged()
 }
 
 // HasTag reports if a node has a given tag.
-// Currently, this function only handles tags set
-// via CLI ("forced tags" and preauthkeys).
 func (node *Node) HasTag(tag string) bool {
-	return slices.Contains(node.Tags(), tag)
+	return slices.Contains(node.Tags, tag)
 }
 
-func (node *Node) Tags() []string {
-	var tags []string
-
-	if node.AuthKey != nil {
-		tags = append(tags, node.AuthKey.Tags...)
+// TypedUserID returns the UserID as a typed UserID type.
+// Returns 0 if UserID is nil.
+func (node *Node) TypedUserID() UserID {
+	if node.UserID == nil {
+		return 0
 	}
 
-	// TODO(kradalby): Figure out how tagging should work
-	// and hostinfo.requestedtags.
-	// Do this in other work.
-	// #2417
-
-	tags = append(tags, node.ForcedTags...)
-	sort.Strings(tags)
-	tags = slices.Compact(tags)
-
-	return tags
+	return UserID(*node.UserID)
 }
 
 func (node *Node) RequestTags() []string {
@@ -389,8 +376,8 @@ func (node *Node) Proto() *v1.Node {
 		IpAddresses: node.IPsAsString(),
 		Name:        node.Hostname,
 		GivenName:   node.GivenName,
-		User:        node.User.Proto(),
-		ForcedTags:  node.ForcedTags,
+		User:        nil, // Will be set below based on node type
+		ForcedTags:  node.Tags,
 		Online:      node.IsOnline != nil && *node.IsOnline,
 
 		// Only ApprovedRoutes and AvailableRoutes is set here. SubnetRoutes has
@@ -402,6 +389,13 @@ func (node *Node) Proto() *v1.Node {
 		RegisterMethod: node.RegisterMethodToV1Enum(),
 
 		CreatedAt: timestamppb.New(node.CreatedAt),
+	}
+
+	// Set User field based on node ownership
+	// Note: User will be set to TaggedDevices in the gRPC layer (grpcv1.go)
+	// for proper MapResponse formatting
+	if node.User != nil {
+		nodeProto.User = node.User.Proto()
 	}
 
 	if node.AuthKey != nil {
@@ -701,8 +695,20 @@ func (nodes Nodes) DebugString() string {
 func (node Node) DebugString() string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "%s(%s):\n", node.Hostname, node.ID)
-	fmt.Fprintf(&sb, "\tUser: %s (%d, %q)\n", node.User.Display(), node.User.ID, node.User.Username())
-	fmt.Fprintf(&sb, "\tTags: %v\n", node.Tags())
+
+	// Show ownership status
+	if node.IsTagged() {
+		fmt.Fprintf(&sb, "\tTagged: %v\n", node.Tags)
+
+		if node.User != nil {
+			fmt.Fprintf(&sb, "\tCreated by: %s (%d, %q)\n", node.User.Display(), node.User.ID, node.User.Username())
+		}
+	} else if node.User != nil {
+		fmt.Fprintf(&sb, "\tUser-owned: %s (%d, %q)\n", node.User.Display(), node.User.ID, node.User.Username())
+	} else {
+		fmt.Fprintf(&sb, "\tOrphaned: no user or tags\n")
+	}
+
 	fmt.Fprintf(&sb, "\tIPs: %v\n", node.IPs())
 	fmt.Fprintf(&sb, "\tApprovedRoutes: %v\n", node.ApprovedRoutes)
 	fmt.Fprintf(&sb, "\tAnnouncedRoutes: %v\n", node.AnnouncedRoutes())
@@ -713,88 +719,88 @@ func (node Node) DebugString() string {
 	return sb.String()
 }
 
-func (v NodeView) UserView() UserView {
-	u := v.User()
-	return u.View()
+func (nv NodeView) UserView() UserView {
+	return nv.User()
 }
 
-func (v NodeView) IPs() []netip.Addr {
-	if !v.Valid() {
+func (nv NodeView) IPs() []netip.Addr {
+	if !nv.Valid() {
 		return nil
 	}
-	return v.ж.IPs()
+
+	return nv.ж.IPs()
 }
 
-func (v NodeView) InIPSet(set *netipx.IPSet) bool {
-	if !v.Valid() {
-		return false
-	}
-	return v.ж.InIPSet(set)
-}
-
-func (v NodeView) CanAccess(matchers []matcher.Match, node2 NodeView) bool {
-	if !v.Valid() {
+func (nv NodeView) InIPSet(set *netipx.IPSet) bool {
+	if !nv.Valid() {
 		return false
 	}
 
-	return v.ж.CanAccess(matchers, node2.AsStruct())
+	return nv.ж.InIPSet(set)
 }
 
-func (v NodeView) CanAccessRoute(matchers []matcher.Match, route netip.Prefix) bool {
-	if !v.Valid() {
+func (nv NodeView) CanAccess(matchers []matcher.Match, node2 NodeView) bool {
+	if !nv.Valid() {
 		return false
 	}
 
-	return v.ж.CanAccessRoute(matchers, route)
+	return nv.ж.CanAccess(matchers, node2.AsStruct())
 }
 
-func (v NodeView) AnnouncedRoutes() []netip.Prefix {
-	if !v.Valid() {
-		return nil
-	}
-	return v.ж.AnnouncedRoutes()
-}
-
-func (v NodeView) SubnetRoutes() []netip.Prefix {
-	if !v.Valid() {
-		return nil
-	}
-	return v.ж.SubnetRoutes()
-}
-
-func (v NodeView) IsSubnetRouter() bool {
-	if !v.Valid() {
+func (nv NodeView) CanAccessRoute(matchers []matcher.Match, route netip.Prefix) bool {
+	if !nv.Valid() {
 		return false
 	}
-	return v.ж.IsSubnetRouter()
+
+	return nv.ж.CanAccessRoute(matchers, route)
 }
 
-func (v NodeView) AllApprovedRoutes() []netip.Prefix {
-	if !v.Valid() {
+func (nv NodeView) AnnouncedRoutes() []netip.Prefix {
+	if !nv.Valid() {
 		return nil
 	}
-	return v.ж.AllApprovedRoutes()
+
+	return nv.ж.AnnouncedRoutes()
 }
 
-func (v NodeView) AppendToIPSet(build *netipx.IPSetBuilder) {
-	if !v.Valid() {
+func (nv NodeView) SubnetRoutes() []netip.Prefix {
+	if !nv.Valid() {
+		return nil
+	}
+
+	return nv.ж.SubnetRoutes()
+}
+
+func (nv NodeView) IsSubnetRouter() bool {
+	if !nv.Valid() {
+		return false
+	}
+
+	return nv.ж.IsSubnetRouter()
+}
+
+func (nv NodeView) AllApprovedRoutes() []netip.Prefix {
+	if !nv.Valid() {
+		return nil
+	}
+
+	return nv.ж.AllApprovedRoutes()
+}
+
+func (nv NodeView) AppendToIPSet(build *netipx.IPSetBuilder) {
+	if !nv.Valid() {
 		return
 	}
-	v.ж.AppendToIPSet(build)
+
+	nv.ж.AppendToIPSet(build)
 }
 
-func (v NodeView) RequestTagsSlice() views.Slice[string] {
-	if !v.Valid() || !v.Hostinfo().Valid() {
+func (nv NodeView) RequestTagsSlice() views.Slice[string] {
+	if !nv.Valid() || !nv.Hostinfo().Valid() {
 		return views.Slice[string]{}
 	}
-	return v.Hostinfo().RequestTags()
-}
 
-func (v NodeView) Tags() []string {
-	if !v.Valid() {
-		return nil
-	}
-	return v.ж.Tags()
+	return nv.Hostinfo().RequestTags()
 }
 
 // IsTagged reports if a device is tagged
@@ -802,128 +808,293 @@ func (v NodeView) Tags() []string {
 // user owned device.
 // Currently, this function only handles tags set
 // via CLI ("forced tags" and preauthkeys).
-func (v NodeView) IsTagged() bool {
-	if !v.Valid() {
+func (nv NodeView) IsTagged() bool {
+	if !nv.Valid() {
 		return false
 	}
-	return v.ж.IsTagged()
+
+	return nv.ж.IsTagged()
 }
 
 // IsExpired returns whether the node registration has expired.
-func (v NodeView) IsExpired() bool {
-	if !v.Valid() {
+func (nv NodeView) IsExpired() bool {
+	if !nv.Valid() {
 		return true
 	}
-	return v.ж.IsExpired()
+
+	return nv.ж.IsExpired()
 }
 
 // IsEphemeral returns if the node is registered as an Ephemeral node.
 // https://tailscale.com/kb/1111/ephemeral-nodes/
-func (v NodeView) IsEphemeral() bool {
-	if !v.Valid() {
+func (nv NodeView) IsEphemeral() bool {
+	if !nv.Valid() {
 		return false
 	}
-	return v.ж.IsEphemeral()
+
+	return nv.ж.IsEphemeral()
 }
 
 // PeerChangeFromMapRequest takes a MapRequest and compares it to the node
 // to produce a PeerChange struct that can be used to updated the node and
 // inform peers about smaller changes to the node.
-func (v NodeView) PeerChangeFromMapRequest(req tailcfg.MapRequest) tailcfg.PeerChange {
-	if !v.Valid() {
+func (nv NodeView) PeerChangeFromMapRequest(req tailcfg.MapRequest) tailcfg.PeerChange {
+	if !nv.Valid() {
 		return tailcfg.PeerChange{}
 	}
-	return v.ж.PeerChangeFromMapRequest(req)
+
+	return nv.ж.PeerChangeFromMapRequest(req)
 }
 
 // GetFQDN returns the fully qualified domain name for the node.
-func (v NodeView) GetFQDN(baseDomain string) (string, error) {
-	if !v.Valid() {
+func (nv NodeView) GetFQDN(baseDomain string) (string, error) {
+	if !nv.Valid() {
 		return "", errors.New("failed to create valid FQDN: node view is invalid")
 	}
-	return v.ж.GetFQDN(baseDomain)
+
+	return nv.ж.GetFQDN(baseDomain)
 }
 
 // ExitRoutes returns a list of both exit routes if the
 // node has any exit routes enabled.
 // If none are enabled, it will return nil.
-func (v NodeView) ExitRoutes() []netip.Prefix {
-	if !v.Valid() {
+func (nv NodeView) ExitRoutes() []netip.Prefix {
+	if !nv.Valid() {
 		return nil
 	}
-	return v.ж.ExitRoutes()
+
+	return nv.ж.ExitRoutes()
 }
 
-func (v NodeView) IsExitNode() bool {
-	if !v.Valid() {
+func (nv NodeView) IsExitNode() bool {
+	if !nv.Valid() {
 		return false
 	}
-	return v.ж.IsExitNode()
+
+	return nv.ж.IsExitNode()
 }
 
 // RequestTags returns the ACL tags that the node is requesting.
-func (v NodeView) RequestTags() []string {
-	if !v.Valid() || !v.Hostinfo().Valid() {
+func (nv NodeView) RequestTags() []string {
+	if !nv.Valid() || !nv.Hostinfo().Valid() {
 		return []string{}
 	}
-	return v.Hostinfo().RequestTags().AsSlice()
+
+	return nv.Hostinfo().RequestTags().AsSlice()
 }
 
 // Proto converts the NodeView to a protobuf representation.
-func (v NodeView) Proto() *v1.Node {
-	if !v.Valid() {
+func (nv NodeView) Proto() *v1.Node {
+	if !nv.Valid() {
 		return nil
 	}
-	return v.ж.Proto()
+
+	return nv.ж.Proto()
 }
 
 // HasIP reports if a node has a given IP address.
-func (v NodeView) HasIP(i netip.Addr) bool {
-	if !v.Valid() {
+func (nv NodeView) HasIP(i netip.Addr) bool {
+	if !nv.Valid() {
 		return false
 	}
-	return v.ж.HasIP(i)
+
+	return nv.ж.HasIP(i)
 }
 
 // HasTag reports if a node has a given tag.
-func (v NodeView) HasTag(tag string) bool {
-	if !v.Valid() {
+func (nv NodeView) HasTag(tag string) bool {
+	if !nv.Valid() {
 		return false
 	}
-	return v.ж.HasTag(tag)
+
+	return nv.ж.HasTag(tag)
+}
+
+// TypedUserID returns the UserID as a typed UserID type.
+// Returns 0 if UserID is nil or node is invalid.
+func (nv NodeView) TypedUserID() UserID {
+	if !nv.Valid() {
+		return 0
+	}
+
+	return nv.ж.TypedUserID()
+}
+
+// TailscaleUserID returns the user ID to use in Tailscale protocol.
+// Tagged nodes always return TaggedDevices.ID, user-owned nodes return their actual UserID.
+func (nv NodeView) TailscaleUserID() tailcfg.UserID {
+	if !nv.Valid() {
+		return 0
+	}
+
+	if nv.IsTagged() {
+		//nolint:gosec // G115: TaggedDevices.ID is a constant that fits in int64
+		return tailcfg.UserID(int64(TaggedDevices.ID))
+	}
+
+	//nolint:gosec // G115: UserID values are within int64 range
+	return tailcfg.UserID(int64(nv.UserID().Get()))
 }
 
 // Prefixes returns the node IPs as netip.Prefix.
-func (v NodeView) Prefixes() []netip.Prefix {
-	if !v.Valid() {
+func (nv NodeView) Prefixes() []netip.Prefix {
+	if !nv.Valid() {
 		return nil
 	}
-	return v.ж.Prefixes()
+
+	return nv.ж.Prefixes()
 }
 
 // IPsAsString returns the node IPs as strings.
-func (v NodeView) IPsAsString() []string {
-	if !v.Valid() {
+func (nv NodeView) IPsAsString() []string {
+	if !nv.Valid() {
 		return nil
 	}
-	return v.ж.IPsAsString()
+
+	return nv.ж.IPsAsString()
 }
 
 // HasNetworkChanges checks if the node has network-related changes.
 // Returns true if IPs, announced routes, or approved routes changed.
 // This is primarily used for policy cache invalidation.
-func (v NodeView) HasNetworkChanges(other NodeView) bool {
-	if !slices.Equal(v.IPs(), other.IPs()) {
+func (nv NodeView) HasNetworkChanges(other NodeView) bool {
+	if !slices.Equal(nv.IPs(), other.IPs()) {
 		return true
 	}
 
-	if !slices.Equal(v.AnnouncedRoutes(), other.AnnouncedRoutes()) {
+	if !slices.Equal(nv.AnnouncedRoutes(), other.AnnouncedRoutes()) {
 		return true
 	}
 
-	if !slices.Equal(v.SubnetRoutes(), other.SubnetRoutes()) {
+	if !slices.Equal(nv.SubnetRoutes(), other.SubnetRoutes()) {
 		return true
 	}
 
 	return false
+}
+
+// HasPolicyChange reports whether the node has changes that affect policy evaluation.
+func (nv NodeView) HasPolicyChange(other NodeView) bool {
+	if nv.UserID() != other.UserID() {
+		return true
+	}
+
+	if !views.SliceEqual(nv.Tags(), other.Tags()) {
+		return true
+	}
+
+	if !slices.Equal(nv.IPs(), other.IPs()) {
+		return true
+	}
+
+	return false
+}
+
+// TailNodes converts a slice of NodeViews into Tailscale tailcfg.Nodes.
+func TailNodes(
+	nodes views.Slice[NodeView],
+	capVer tailcfg.CapabilityVersion,
+	primaryRouteFunc RouteFunc,
+	cfg *Config,
+) ([]*tailcfg.Node, error) {
+	tNodes := make([]*tailcfg.Node, 0, nodes.Len())
+
+	for _, node := range nodes.All() {
+		tNode, err := node.TailNode(capVer, primaryRouteFunc, cfg)
+		if err != nil {
+			return nil, err
+		}
+
+		tNodes = append(tNodes, tNode)
+	}
+
+	return tNodes, nil
+}
+
+// TailNode converts a NodeView into a Tailscale tailcfg.Node.
+func (nv NodeView) TailNode(
+	capVer tailcfg.CapabilityVersion,
+	primaryRouteFunc RouteFunc,
+	cfg *Config,
+) (*tailcfg.Node, error) {
+	if !nv.Valid() {
+		return nil, ErrInvalidNodeView
+	}
+
+	hostname, err := nv.GetFQDN(cfg.BaseDomain)
+	if err != nil {
+		return nil, err
+	}
+
+	var derp int
+	// TODO(kradalby): legacyDERP was removed in tailscale/tailscale@2fc4455e6dd9ab7f879d4e2f7cffc2be81f14077
+	// and should be removed after 111 is the minimum capver.
+	legacyDERP := "127.3.3.40:0" // Zero means disconnected or unknown.
+	if nv.Hostinfo().Valid() && nv.Hostinfo().NetInfo().Valid() {
+		legacyDERP = fmt.Sprintf("127.3.3.40:%d", nv.Hostinfo().NetInfo().PreferredDERP())
+		derp = nv.Hostinfo().NetInfo().PreferredDERP()
+	}
+
+	var keyExpiry time.Time
+	if nv.Expiry().Valid() {
+		keyExpiry = nv.Expiry().Get()
+	}
+
+	primaryRoutes := primaryRouteFunc(nv.ID())
+	allowedIPs := slices.Concat(nv.Prefixes(), primaryRoutes, nv.ExitRoutes())
+	tsaddr.SortPrefixes(allowedIPs)
+
+	capMap := tailcfg.NodeCapMap{
+		tailcfg.CapabilityAdmin: []tailcfg.RawMessage{},
+		tailcfg.CapabilitySSH:   []tailcfg.RawMessage{},
+	}
+	if cfg.RandomizeClientPort {
+		capMap[tailcfg.NodeAttrRandomizeClientPort] = []tailcfg.RawMessage{}
+	}
+
+	if cfg.Taildrop.Enabled {
+		capMap[tailcfg.CapabilityFileSharing] = []tailcfg.RawMessage{}
+	}
+
+	tNode := tailcfg.Node{
+		//nolint:gosec // G115: NodeID values are within int64 range
+		ID:       tailcfg.NodeID(nv.ID()),
+		StableID: nv.ID().StableID(),
+		Name:     hostname,
+		Cap:      capVer,
+		CapMap:   capMap,
+
+		User: nv.TailscaleUserID(),
+
+		Key:       nv.NodeKey(),
+		KeyExpiry: keyExpiry.UTC(),
+
+		Machine:          nv.MachineKey(),
+		DiscoKey:         nv.DiscoKey(),
+		Addresses:        nv.Prefixes(),
+		PrimaryRoutes:    primaryRoutes,
+		AllowedIPs:       allowedIPs,
+		Endpoints:        nv.Endpoints().AsSlice(),
+		HomeDERP:         derp,
+		LegacyDERPString: legacyDERP,
+		Hostinfo:         nv.Hostinfo(),
+		Created:          nv.CreatedAt().UTC(),
+
+		Online: nv.IsOnline().Clone(),
+
+		Tags: nv.Tags().AsSlice(),
+
+		MachineAuthorized: !nv.IsExpired(),
+		Expired:           nv.IsExpired(),
+	}
+
+	// Set LastSeen only for offline nodes to avoid confusing Tailscale clients
+	// during rapid reconnection cycles. Online nodes should not have LastSeen set
+	// as this can make clients interpret them as "not online" despite Online=true.
+	if nv.LastSeen().Valid() && nv.IsOnline().Valid() && !nv.IsOnline().Get() {
+		lastSeen := nv.LastSeen().Get()
+		tNode.LastSeen = &lastSeen
+	}
+
+	return &tNode, nil
 }

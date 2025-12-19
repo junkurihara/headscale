@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/ptr"
 )
 
 func node(name, ipv4, ipv6 string, user types.User, hostinfo *tailcfg.Hostinfo) *types.Node {
@@ -19,8 +20,8 @@ func node(name, ipv4, ipv6 string, user types.User, hostinfo *tailcfg.Hostinfo) 
 		Hostname: name,
 		IPv4:     ap(ipv4),
 		IPv6:     ap(ipv6),
-		User:     user,
-		UserID:   user.ID,
+		User:     ptr.To(user),
+		UserID:   ptr.To(user.ID),
 		Hostinfo: hostinfo,
 	}
 }
@@ -456,21 +457,21 @@ func TestAutogroupSelfWithOtherRules(t *testing.T) {
 		Hostname: "test-1-device",
 		IPv4:     ap("100.64.0.1"),
 		IPv6:     ap("fd7a:115c:a1e0::1"),
-		User:     users[0],
-		UserID:   users[0].ID,
+		User:     ptr.To(users[0]),
+		UserID:   ptr.To(users[0].ID),
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
 
 	// test-2 has a router device with tag:node-router
 	test2RouterNode := &types.Node{
-		ID:         2,
-		Hostname:   "test-2-router",
-		IPv4:       ap("100.64.0.2"),
-		IPv6:       ap("fd7a:115c:a1e0::2"),
-		User:       users[1],
-		UserID:     users[1].ID,
-		ForcedTags: []string{"tag:node-router"},
-		Hostinfo:   &tailcfg.Hostinfo{},
+		ID:       2,
+		Hostname: "test-2-router",
+		IPv4:     ap("100.64.0.2"),
+		IPv6:     ap("fd7a:115c:a1e0::2"),
+		User:     ptr.To(users[1]),
+		UserID:   ptr.To(users[1].ID),
+		Tags:     []string{"tag:node-router"},
+		Hostinfo: &tailcfg.Hostinfo{},
 	}
 
 	nodes := types.Nodes{test1Node, test2RouterNode}
@@ -518,4 +519,213 @@ func TestAutogroupSelfWithOtherRules(t *testing.T) {
 	rules, err := pm.FilterForNode(test1Node.View())
 	require.NoError(t, err)
 	require.NotEmpty(t, rules, "test-1 should have filter rules from both ACL rules")
+}
+
+// TestAutogroupSelfPolicyUpdateTriggersMapResponse verifies that when a policy with
+// autogroup:self is updated, SetPolicy returns true to trigger MapResponse updates,
+// even if the global filter hash didn't change (which is always empty for autogroup:self).
+// This fixes the issue where policy updates would clear caches but not trigger updates,
+// leaving nodes with stale filter rules until reconnect.
+func TestAutogroupSelfPolicyUpdateTriggersMapResponse(t *testing.T) {
+	users := types.Users{
+		{Model: gorm.Model{ID: 1}, Name: "test-1", Email: "test-1@example.com"},
+		{Model: gorm.Model{ID: 2}, Name: "test-2", Email: "test-2@example.com"},
+	}
+
+	test1Node := &types.Node{
+		ID:       1,
+		Hostname: "test-1-device",
+		IPv4:     ap("100.64.0.1"),
+		IPv6:     ap("fd7a:115c:a1e0::1"),
+		User:     ptr.To(users[0]),
+		UserID:   ptr.To(users[0].ID),
+		Hostinfo: &tailcfg.Hostinfo{},
+	}
+
+	test2Node := &types.Node{
+		ID:       2,
+		Hostname: "test-2-device",
+		IPv4:     ap("100.64.0.2"),
+		IPv6:     ap("fd7a:115c:a1e0::2"),
+		User:     ptr.To(users[1]),
+		UserID:   ptr.To(users[1].ID),
+		Hostinfo: &tailcfg.Hostinfo{},
+	}
+
+	nodes := types.Nodes{test1Node, test2Node}
+
+	// Initial policy with autogroup:self
+	initialPolicy := `{
+		"acls": [
+			{
+				"action": "accept",
+				"src": ["autogroup:member"],
+				"dst": ["autogroup:self:*"]
+			}
+		]
+	}`
+
+	pm, err := NewPolicyManager([]byte(initialPolicy), users, nodes.ViewSlice())
+	require.NoError(t, err)
+	require.True(t, pm.usesAutogroupSelf, "policy should use autogroup:self")
+
+	// Get initial filter rules for test-1 (should be cached)
+	rules1, err := pm.FilterForNode(test1Node.View())
+	require.NoError(t, err)
+	require.NotEmpty(t, rules1, "test-1 should have filter rules")
+
+	// Update policy with a different ACL that still results in empty global filter
+	// (only autogroup:self rules, which compile to empty global filter)
+	// We add a comment/description change by adding groups (which don't affect filter compilation)
+	updatedPolicy := `{
+		"groups": {
+			"group:test": ["test-1@example.com"]
+		},
+		"acls": [
+			{
+				"action": "accept",
+				"src": ["autogroup:member"],
+				"dst": ["autogroup:self:*"]
+			}
+		]
+	}`
+
+	// SetPolicy should return true even though global filter hash didn't change
+	policyChanged, err := pm.SetPolicy([]byte(updatedPolicy))
+	require.NoError(t, err)
+	require.True(t, policyChanged, "SetPolicy should return true when policy content changes, even if global filter hash unchanged (autogroup:self)")
+
+	// Verify that caches were cleared and new rules are generated
+	// The cache should be empty, so FilterForNode will recompile
+	rules2, err := pm.FilterForNode(test1Node.View())
+	require.NoError(t, err)
+	require.NotEmpty(t, rules2, "test-1 should have filter rules after policy update")
+
+	// Verify that the policy hash tracking works - a second identical update should return false
+	policyChanged2, err := pm.SetPolicy([]byte(updatedPolicy))
+	require.NoError(t, err)
+	require.False(t, policyChanged2, "SetPolicy should return false when policy content hasn't changed")
+}
+
+// TestTagPropagationToPeerMap tests that when a node's tags change,
+// the peer map is correctly updated. This is a regression test for
+// https://github.com/juanfont/headscale/issues/2389
+func TestTagPropagationToPeerMap(t *testing.T) {
+	users := types.Users{
+		{Model: gorm.Model{ID: 1}, Name: "user1", Email: "user1@headscale.net"},
+		{Model: gorm.Model{ID: 2}, Name: "user2", Email: "user2@headscale.net"},
+	}
+
+	// Policy: user2 can access tag:web nodes
+	policy := `{
+		"tagOwners": {
+			"tag:web": ["user1@headscale.net"],
+			"tag:internal": ["user1@headscale.net"]
+		},
+		"acls": [
+			{
+				"action": "accept",
+				"src": ["user2@headscale.net"],
+				"dst": ["user2@headscale.net:*"]
+			},
+			{
+				"action": "accept",
+				"src": ["user2@headscale.net"],
+				"dst": ["tag:web:*"]
+			},
+			{
+				"action": "accept",
+				"src": ["tag:web"],
+				"dst": ["user2@headscale.net:*"]
+			}
+		]
+	}`
+
+	// user1's node starts with tag:web and tag:internal
+	user1Node := &types.Node{
+		ID:       1,
+		Hostname: "user1-node",
+		IPv4:     ap("100.64.0.1"),
+		IPv6:     ap("fd7a:115c:a1e0::1"),
+		User:     ptr.To(users[0]),
+		UserID:   ptr.To(users[0].ID),
+		Tags:     []string{"tag:web", "tag:internal"},
+	}
+
+	// user2's node (no tags)
+	user2Node := &types.Node{
+		ID:       2,
+		Hostname: "user2-node",
+		IPv4:     ap("100.64.0.2"),
+		IPv6:     ap("fd7a:115c:a1e0::2"),
+		User:     ptr.To(users[1]),
+		UserID:   ptr.To(users[1].ID),
+	}
+
+	initialNodes := types.Nodes{user1Node, user2Node}
+
+	pm, err := NewPolicyManager([]byte(policy), users, initialNodes.ViewSlice())
+	require.NoError(t, err)
+
+	// Initial state: user2 should see user1 as a peer (user1 has tag:web)
+	initialPeerMap := pm.BuildPeerMap(initialNodes.ViewSlice())
+
+	// Check user2's peers - should include user1
+	user2Peers := initialPeerMap[user2Node.ID]
+	require.Len(t, user2Peers, 1, "user2 should have 1 peer initially (user1 with tag:web)")
+	require.Equal(t, user1Node.ID, user2Peers[0].ID(), "user2's peer should be user1")
+
+	// Check user1's peers - should include user2 (bidirectional ACL)
+	user1Peers := initialPeerMap[user1Node.ID]
+	require.Len(t, user1Peers, 1, "user1 should have 1 peer initially (user2)")
+	require.Equal(t, user2Node.ID, user1Peers[0].ID(), "user1's peer should be user2")
+
+	// Now change user1's tags: remove tag:web, keep only tag:internal
+	user1NodeUpdated := &types.Node{
+		ID:       1,
+		Hostname: "user1-node",
+		IPv4:     ap("100.64.0.1"),
+		IPv6:     ap("fd7a:115c:a1e0::1"),
+		User:     ptr.To(users[0]),
+		UserID:   ptr.To(users[0].ID),
+		Tags:     []string{"tag:internal"}, // tag:web removed!
+	}
+
+	updatedNodes := types.Nodes{user1NodeUpdated, user2Node}
+
+	// SetNodes should detect the tag change
+	changed, err := pm.SetNodes(updatedNodes.ViewSlice())
+	require.NoError(t, err)
+	require.True(t, changed, "SetNodes should return true when tags change")
+
+	// After tag change: user2 should NOT see user1 as a peer anymore
+	// (no ACL allows user2 to access tag:internal)
+	updatedPeerMap := pm.BuildPeerMap(updatedNodes.ViewSlice())
+
+	// Check user2's peers - should be empty now
+	user2PeersAfter := updatedPeerMap[user2Node.ID]
+	require.Empty(t, user2PeersAfter, "user2 should have no peers after tag:web is removed from user1")
+
+	// Check user1's peers - should also be empty
+	user1PeersAfter := updatedPeerMap[user1Node.ID]
+	require.Empty(t, user1PeersAfter, "user1 should have no peers after tag:web is removed")
+
+	// Also verify MatchersForNode returns non-empty matchers and ReduceNodes filters correctly
+	// This simulates what buildTailPeers does in the mapper
+	matchersForUser2, err := pm.MatchersForNode(user2Node.View())
+	require.NoError(t, err)
+	require.NotEmpty(t, matchersForUser2, "MatchersForNode should return non-empty matchers (at least self-access rule)")
+
+	// Test ReduceNodes logic with the updated nodes and matchers
+	// This is what buildTailPeers does - it takes peers from ListPeers (which might include user1)
+	// and filters them using ReduceNodes with the updated matchers
+	// Inline the ReduceNodes logic to avoid import cycle
+	user2View := user2Node.View()
+	user1UpdatedView := user1NodeUpdated.View()
+
+	// Check if user2 can access user1 OR user1 can access user2
+	canAccess := user2View.CanAccess(matchersForUser2, user1UpdatedView) ||
+		user1UpdatedView.CanAccess(matchersForUser2, user2View)
+
+	require.False(t, canAccess, "user2 should NOT be able to access user1 after tag:web is removed (ReduceNodes should filter out)")
 }

@@ -22,6 +22,21 @@ type UserID uint64
 
 type Users []User
 
+const (
+	// TaggedDevicesUserID is the special user ID for tagged devices.
+	// This ID is used when rendering tagged nodes in the Tailscale protocol.
+	TaggedDevicesUserID = 2147455555
+)
+
+// TaggedDevices is a special user used in MapResponse for tagged nodes.
+// Tagged nodes don't belong to a real user - the tag is their identity.
+// This special user ID is used when rendering tagged nodes in the Tailscale protocol.
+var TaggedDevices = User{
+	Model:       gorm.Model{ID: TaggedDevicesUserID},
+	Name:        "tagged-devices",
+	DisplayName: "Tagged Devices",
+}
+
 func (u Users) String() string {
 	var sb strings.Builder
 	sb.WriteString("[ ")
@@ -77,6 +92,13 @@ func (u *User) StringID() string {
 	return strconv.FormatUint(uint64(u.ID), 10)
 }
 
+// TypedID returns a pointer to the user's ID as a UserID type.
+// This is a convenience method to avoid ugly casting like ptr.To(types.UserID(user.ID)).
+func (u *User) TypedID() *UserID {
+	uid := UserID(u.ID)
+	return &uid
+}
+
 // Username is the main way to get the username of a user,
 // it will return the email if it exists, the name if it exists,
 // the OIDCIdentifier if it exists, and the ID if nothing else exists.
@@ -115,6 +137,13 @@ func (u *User) TailscaleUser() tailcfg.User {
 
 func (u UserView) TailscaleUser() tailcfg.User {
 	return u.ж.TailscaleUser()
+}
+
+// ID returns the user's ID.
+// This is a custom accessor because gorm.Model.ID is embedded
+// and the viewer generator doesn't always produce it.
+func (u UserView) ID() uint {
+	return u.ж.ID
 }
 
 func (u *User) TailscaleLogin() tailcfg.Login {
@@ -324,7 +353,7 @@ type OIDCUserInfo struct {
 
 // FromClaim overrides a User from OIDC claims.
 // All fields will be updated, except for the ID.
-func (u *User) FromClaim(claims *OIDCClaims) {
+func (u *User) FromClaim(claims *OIDCClaims, emailVerifiedRequired bool) {
 	err := util.ValidateUsername(claims.Username)
 	if err == nil {
 		u.Name = claims.Username
@@ -332,7 +361,7 @@ func (u *User) FromClaim(claims *OIDCClaims) {
 		log.Debug().Caller().Err(err).Msgf("Username %s is not valid", claims.Username)
 	}
 
-	if claims.EmailVerified {
+	if claims.EmailVerified || !FlexibleBoolean(emailVerifiedRequired) {
 		_, err = mail.ParseAddress(claims.Email)
 		if err == nil {
 			u.Email = claims.Email
