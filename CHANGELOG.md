@@ -15,6 +15,9 @@ User-owned nodes can now request tags during registration using `--advertise-tag
 and applied at registration time. Tags can be managed via the CLI or API after registration. Tagged nodes can return to user-owned
 by re-authenticating with `tailscale up --advertise-tags= --force-reauth`.
 
+A one-time migration will validate and migrate any `RequestTags` (stored in hostinfo) to the tags column. Tags are validated against
+your policy's `tagOwners` rules during migration. [#3011](https://github.com/juanfont/headscale/pull/3011)
+
 ### Smarter map updates
 
 The map update system has been rewritten to send smaller, partial updates instead of full network maps whenever possible. This reduces bandwidth usage and improves performance, especially for large networks. The system now properly tracks peer
@@ -42,6 +45,30 @@ sequentially through each stable release, selecting the latest patch version ava
 - **API**: The Node message in the gRPC/REST API has been simplified - the `ForcedTags`, `InvalidTags`, and `ValidTags` fields have been removed and replaced with a single `Tags` field that contains the node's applied tags [#2993](https://github.com/juanfont/headscale/pull/2993)
   - API clients should use the `Tags` field instead of `ValidTags`
   - The `headscale nodes list` CLI command now always shows a Tags column and the `--tags` flag has been removed
+- **PreAuthKey CLI**: Commands now use ID-based operations instead of user+key combinations [#2992](https://github.com/juanfont/headscale/pull/2992)
+  - `headscale preauthkeys create` no longer requires `--user` flag (optional for tracking creation)
+  - `headscale preauthkeys list` lists all keys (no longer filtered by user)
+  - `headscale preauthkeys expire --id <ID>` replaces `--user <USER> <KEY>`
+  - `headscale preauthkeys delete --id <ID>` replaces `--user <USER> <KEY>`
+
+  **Before:**
+
+  ```bash
+  headscale preauthkeys create --user 1 --reusable --tags tag:server
+  headscale preauthkeys list --user 1
+  headscale preauthkeys expire --user 1 <KEY>
+  headscale preauthkeys delete --user 1 <KEY>
+  ```
+
+  **After:**
+
+  ```bash
+  headscale preauthkeys create --reusable --tags tag:server
+  headscale preauthkeys list
+  headscale preauthkeys expire --id 123
+  headscale preauthkeys delete --id 123
+  ```
+
 - **Tags**: The gRPC `SetTags` endpoint now allows converting user-owned nodes to tagged nodes by setting tags. [#2885](https://github.com/juanfont/headscale/pull/2885)
 - **Tags**: Tags are now resolved from the node's stored Tags field only [#2931](https://github.com/juanfont/headscale/pull/2931)
   - `--advertise-tags` is processed during registration, not on every policy evaluation
@@ -55,13 +82,64 @@ sequentially through each stable release, selecting the latest patch version ava
 - Remove ability to move nodes between users [#2922](https://github.com/juanfont/headscale/pull/2922)
   - The `headscale nodes move` CLI command has been removed
   - The `MoveNode` API endpoint has been removed
-  - Nodes are permanently associated with their user at registration time
+  - Nodes are permanently associated with their user or tag at registration time
 - Add `oidc.email_verified_required` config option to control email verification requirement [#2860](https://github.com/juanfont/headscale/pull/2860)
   - When `true` (default), only verified emails can authenticate via OIDC in conjunction with `oidc.allowed_domains` or
     `oidc.allowed_users`. Previous versions allowed to authenticate with an unverified email but did not store the email
     address in the user profile. This is now rejected during authentication with an `unverified email` error.
   - When `false`, unverified emails are allowed for OIDC authentication and the email address is stored in the user
     profile regardless of its verification state.
+- **SSH Policy**: Wildcard (`*`) is no longer supported as an SSH destination [#3009](https://github.com/juanfont/headscale/issues/3009)
+  - Use `autogroup:member` for user-owned devices
+  - Use `autogroup:tagged` for tagged devices
+  - Use specific tags (e.g., `tag:server`) for targeted access
+
+  **Before:**
+
+  ```json
+  { "action": "accept", "src": ["group:admins"], "dst": ["*"], "users": ["root"] }
+  ```
+
+  **After:**
+
+  ```json
+  { "action": "accept", "src": ["group:admins"], "dst": ["autogroup:member", "autogroup:tagged"], "users": ["root"] }
+  ```
+
+- **SSH Policy**: SSH source/destination validation now enforces Tailscale's security model [#3010](https://github.com/juanfont/headscale/issues/3010)
+
+  Per [Tailscale SSH documentation](https://tailscale.com/kb/1193/tailscale-ssh), the following rules are now enforced:
+  1. **Tags cannot SSH to user-owned devices**: SSH rules with `tag:*` or `autogroup:tagged` as source cannot have username destinations (e.g., `alice@`) or `autogroup:member`/`autogroup:self` as destination
+  2. **Username destinations require same-user source**: If destination is a specific username (e.g., `alice@`), the source must be that exact same user only. Use `autogroup:self` for same-user SSH access instead
+
+  **Invalid policies now rejected at load time:**
+
+  ```json
+  // INVALID: tag source to user destination
+  {"src": ["tag:server"], "dst": ["alice@"], ...}
+
+  // INVALID: autogroup:tagged to autogroup:member
+  {"src": ["autogroup:tagged"], "dst": ["autogroup:member"], ...}
+
+  // INVALID: group to specific user (use autogroup:self instead)
+  {"src": ["group:admins"], "dst": ["alice@"], ...}
+  ```
+
+  **Valid patterns:**
+
+  ```json
+  // Users/groups can SSH to their own devices via autogroup:self
+  {"src": ["group:admins"], "dst": ["autogroup:self"], ...}
+
+  // Users/groups can SSH to tagged devices
+  {"src": ["group:admins"], "dst": ["autogroup:tagged"], ...}
+
+  // Tagged devices can SSH to other tagged devices
+  {"src": ["autogroup:tagged"], "dst": ["autogroup:tagged"], ...}
+
+  // Same user can SSH to their own devices
+  {"src": ["alice@"], "dst": ["alice@"], ...}
+  ```
 
 ### Changes
 
@@ -84,6 +162,9 @@ sequentially through each stable release, selecting the latest patch version ava
 - Fix autogroup:self preventing visibility of nodes matched by other ACL rules [#2882](https://github.com/juanfont/headscale/pull/2882)
 - Fix nodes being rejected after pre-authentication key expiration [#2917](https://github.com/juanfont/headscale/pull/2917)
 - Fix list-routes command respecting identifier filter with JSON output [#2927](https://github.com/juanfont/headscale/pull/2927)
+- **API Key CLI**: Add `--id` flag to expire/delete commands as alternative to `--prefix` [#3016](https://github.com/juanfont/headscale/pull/3016)
+  - `headscale apikeys expire --id <ID>` or `--prefix <PREFIX>`
+  - `headscale apikeys delete --id <ID>` or `--prefix <PREFIX>`
 
 ## 0.27.1 (2025-11-11)
 
