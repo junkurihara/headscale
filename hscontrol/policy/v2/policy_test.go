@@ -11,18 +11,16 @@ import (
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/ptr"
 )
 
-func node(name, ipv4, ipv6 string, user types.User, hostinfo *tailcfg.Hostinfo) *types.Node {
+func node(name, ipv4, ipv6 string, user types.User) *types.Node {
 	return &types.Node{
 		ID:       0,
 		Hostname: name,
 		IPv4:     ap(ipv4),
 		IPv6:     ap(ipv6),
-		User:     ptr.To(user),
-		UserID:   ptr.To(user.ID),
-		Hostinfo: hostinfo,
+		User:     new(user),
+		UserID:   new(user.ID),
 	}
 }
 
@@ -57,6 +55,7 @@ func TestPolicyManager(t *testing.T) {
 			if diff := cmp.Diff(tt.wantFilter, filter); diff != "" {
 				t.Errorf("Filter() filter mismatch (-want +got):\n%s", diff)
 			}
+
 			if diff := cmp.Diff(
 				tt.wantMatchers,
 				matchers,
@@ -77,6 +76,7 @@ func TestInvalidateAutogroupSelfCache(t *testing.T) {
 		{Model: gorm.Model{ID: 3}, Name: "user3", Email: "user3@headscale.net"},
 	}
 
+	//nolint:goconst // test-specific inline policy for clarity
 	policy := `{
 		"acls": [
 			{
@@ -88,14 +88,14 @@ func TestInvalidateAutogroupSelfCache(t *testing.T) {
 	}`
 
 	initialNodes := types.Nodes{
-		node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0], nil),
-		node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0], nil),
-		node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1], nil),
-		node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2], nil),
+		node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+		node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
+		node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
+		node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2]),
 	}
 
 	for i, n := range initialNodes {
-		n.ID = types.NodeID(i + 1)
+		n.ID = types.NodeID(i + 1) //nolint:gosec // safe conversion in test
 	}
 
 	pm, err := NewPolicyManager([]byte(policy), users, initialNodes.ViewSlice())
@@ -107,7 +107,7 @@ func TestInvalidateAutogroupSelfCache(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	require.Equal(t, len(initialNodes), len(pm.filterRulesMap))
+	require.Len(t, pm.filterRulesMap, len(initialNodes))
 
 	tests := []struct {
 		name            string
@@ -118,10 +118,10 @@ func TestInvalidateAutogroupSelfCache(t *testing.T) {
 		{
 			name: "no_changes",
 			newNodes: types.Nodes{
-				node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0], nil),
-				node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0], nil),
-				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1], nil),
-				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2], nil),
+				node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+				node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
+				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
+				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2]),
 			},
 			expectedCleared: 0,
 			description:     "No changes should clear no cache entries",
@@ -129,11 +129,11 @@ func TestInvalidateAutogroupSelfCache(t *testing.T) {
 		{
 			name: "node_added",
 			newNodes: types.Nodes{
-				node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0], nil),
-				node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0], nil),
-				node("user1-node3", "100.64.0.5", "fd7a:115c:a1e0::5", users[0], nil), // New node
-				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1], nil),
-				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2], nil),
+				node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+				node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
+				node("user1-node3", "100.64.0.5", "fd7a:115c:a1e0::5", users[0]), // New node
+				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
+				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2]),
 			},
 			expectedCleared: 2, // user1's existing nodes should be cleared
 			description:     "Adding a node should clear cache for that user's existing nodes",
@@ -141,10 +141,10 @@ func TestInvalidateAutogroupSelfCache(t *testing.T) {
 		{
 			name: "node_removed",
 			newNodes: types.Nodes{
-				node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0], nil),
+				node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
 				// user1-node2 removed
-				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1], nil),
-				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2], nil),
+				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
+				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2]),
 			},
 			expectedCleared: 2, // user1's remaining node + removed node should be cleared
 			description:     "Removing a node should clear cache for that user's remaining nodes",
@@ -152,10 +152,10 @@ func TestInvalidateAutogroupSelfCache(t *testing.T) {
 		{
 			name: "user_changed",
 			newNodes: types.Nodes{
-				node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0], nil),
-				node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[2], nil), // Changed to user3
-				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1], nil),
-				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2], nil),
+				node("user1-node1", "100.64.0.1", "fd7a:115c:a1e0::1", users[0]),
+				node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[2]), // Changed to user3
+				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
+				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2]),
 			},
 			expectedCleared: 3, // user1's node + user2's node + user3's nodes should be cleared
 			description:     "Changing a node's user should clear cache for both old and new users",
@@ -163,10 +163,10 @@ func TestInvalidateAutogroupSelfCache(t *testing.T) {
 		{
 			name: "ip_changed",
 			newNodes: types.Nodes{
-				node("user1-node1", "100.64.0.10", "fd7a:115c:a1e0::10", users[0], nil), // IP changed
-				node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0], nil),
-				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1], nil),
-				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2], nil),
+				node("user1-node1", "100.64.0.10", "fd7a:115c:a1e0::10", users[0]), // IP changed
+				node("user1-node2", "100.64.0.2", "fd7a:115c:a1e0::2", users[0]),
+				node("user2-node1", "100.64.0.3", "fd7a:115c:a1e0::3", users[1]),
+				node("user3-node1", "100.64.0.4", "fd7a:115c:a1e0::4", users[2]),
 			},
 			expectedCleared: 2, // user1's nodes should be cleared
 			description:     "Changing a node's IP should clear cache for that user's nodes",
@@ -177,15 +177,18 @@ func TestInvalidateAutogroupSelfCache(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			for i, n := range tt.newNodes {
 				found := false
+
 				for _, origNode := range initialNodes {
 					if n.Hostname == origNode.Hostname {
 						n.ID = origNode.ID
 						found = true
+
 						break
 					}
 				}
+
 				if !found {
-					n.ID = types.NodeID(len(initialNodes) + i + 1)
+					n.ID = types.NodeID(len(initialNodes) + i + 1) //nolint:gosec // safe conversion in test
 				}
 			}
 
@@ -370,16 +373,16 @@ func TestInvalidateGlobalPolicyCache(t *testing.T) {
 
 // TestAutogroupSelfReducedVsUnreducedRules verifies that:
 // 1. BuildPeerMap uses unreduced compiled rules for determining peer relationships
-// 2. FilterForNode returns reduced compiled rules for packet filters
+// 2. FilterForNode returns reduced compiled rules for packet filters.
 func TestAutogroupSelfReducedVsUnreducedRules(t *testing.T) {
 	user1 := types.User{Model: gorm.Model{ID: 1}, Name: "user1", Email: "user1@headscale.net"}
 	user2 := types.User{Model: gorm.Model{ID: 2}, Name: "user2", Email: "user2@headscale.net"}
 	users := types.Users{user1, user2}
 
 	// Create two nodes
-	node1 := node("node1", "100.64.0.1", "fd7a:115c:a1e0::1", user1, nil)
+	node1 := node("node1", "100.64.0.1", "fd7a:115c:a1e0::1", user1)
 	node1.ID = 1
-	node2 := node("node2", "100.64.0.2", "fd7a:115c:a1e0::2", user2, nil)
+	node2 := node("node2", "100.64.0.2", "fd7a:115c:a1e0::2", user2)
 	node2.ID = 2
 	nodes := types.Nodes{node1, node2}
 
@@ -410,6 +413,7 @@ func TestAutogroupSelfReducedVsUnreducedRules(t *testing.T) {
 	// FilterForNode should return reduced rules - verify they only contain the node's own IPs as destinations
 	// For node1, destinations should only be node1's IPs
 	node1IPs := []string{"100.64.0.1/32", "100.64.0.1", "fd7a:115c:a1e0::1/128", "fd7a:115c:a1e0::1"}
+
 	for _, rule := range filterNode1 {
 		for _, dst := range rule.DstPorts {
 			require.Contains(t, node1IPs, dst.IP,
@@ -419,6 +423,7 @@ func TestAutogroupSelfReducedVsUnreducedRules(t *testing.T) {
 
 	// For node2, destinations should only be node2's IPs
 	node2IPs := []string{"100.64.0.2/32", "100.64.0.2", "fd7a:115c:a1e0::2/128", "fd7a:115c:a1e0::2"}
+
 	for _, rule := range filterNode2 {
 		for _, dst := range rule.DstPorts {
 			require.Contains(t, node2IPs, dst.IP,
@@ -457,8 +462,8 @@ func TestAutogroupSelfWithOtherRules(t *testing.T) {
 		Hostname: "test-1-device",
 		IPv4:     ap("100.64.0.1"),
 		IPv6:     ap("fd7a:115c:a1e0::1"),
-		User:     ptr.To(users[0]),
-		UserID:   ptr.To(users[0].ID),
+		User:     new(users[0]),
+		UserID:   new(users[0].ID),
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
 
@@ -468,8 +473,8 @@ func TestAutogroupSelfWithOtherRules(t *testing.T) {
 		Hostname: "test-2-router",
 		IPv4:     ap("100.64.0.2"),
 		IPv6:     ap("fd7a:115c:a1e0::2"),
-		User:     ptr.To(users[1]),
-		UserID:   ptr.To(users[1].ID),
+		User:     new(users[1]),
+		UserID:   new(users[1].ID),
 		Tags:     []string{"tag:node-router"},
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
@@ -537,8 +542,8 @@ func TestAutogroupSelfPolicyUpdateTriggersMapResponse(t *testing.T) {
 		Hostname: "test-1-device",
 		IPv4:     ap("100.64.0.1"),
 		IPv6:     ap("fd7a:115c:a1e0::1"),
-		User:     ptr.To(users[0]),
-		UserID:   ptr.To(users[0].ID),
+		User:     new(users[0]),
+		UserID:   new(users[0].ID),
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
 
@@ -547,8 +552,8 @@ func TestAutogroupSelfPolicyUpdateTriggersMapResponse(t *testing.T) {
 		Hostname: "test-2-device",
 		IPv4:     ap("100.64.0.2"),
 		IPv6:     ap("fd7a:115c:a1e0::2"),
-		User:     ptr.To(users[1]),
-		UserID:   ptr.To(users[1].ID),
+		User:     new(users[1]),
+		UserID:   new(users[1].ID),
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
 
@@ -647,8 +652,8 @@ func TestTagPropagationToPeerMap(t *testing.T) {
 		Hostname: "user1-node",
 		IPv4:     ap("100.64.0.1"),
 		IPv6:     ap("fd7a:115c:a1e0::1"),
-		User:     ptr.To(users[0]),
-		UserID:   ptr.To(users[0].ID),
+		User:     new(users[0]),
+		UserID:   new(users[0].ID),
 		Tags:     []string{"tag:web", "tag:internal"},
 	}
 
@@ -658,8 +663,8 @@ func TestTagPropagationToPeerMap(t *testing.T) {
 		Hostname: "user2-node",
 		IPv4:     ap("100.64.0.2"),
 		IPv6:     ap("fd7a:115c:a1e0::2"),
-		User:     ptr.To(users[1]),
-		UserID:   ptr.To(users[1].ID),
+		User:     new(users[1]),
+		UserID:   new(users[1].ID),
 	}
 
 	initialNodes := types.Nodes{user1Node, user2Node}
@@ -686,8 +691,8 @@ func TestTagPropagationToPeerMap(t *testing.T) {
 		Hostname: "user1-node",
 		IPv4:     ap("100.64.0.1"),
 		IPv6:     ap("fd7a:115c:a1e0::1"),
-		User:     ptr.To(users[0]),
-		UserID:   ptr.To(users[0].ID),
+		User:     new(users[0]),
+		UserID:   new(users[0].ID),
 		Tags:     []string{"tag:internal"}, // tag:web removed!
 	}
 
@@ -749,8 +754,8 @@ func TestAutogroupSelfWithAdminOverride(t *testing.T) {
 		Hostname: "admin-device",
 		IPv4:     ap("100.64.0.1"),
 		IPv6:     ap("fd7a:115c:a1e0::1"),
-		User:     ptr.To(users[0]),
-		UserID:   ptr.To(users[0].ID),
+		User:     new(users[0]),
+		UserID:   new(users[0].ID),
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
 
@@ -760,8 +765,8 @@ func TestAutogroupSelfWithAdminOverride(t *testing.T) {
 		Hostname: "user1-server",
 		IPv4:     ap("100.64.0.2"),
 		IPv6:     ap("fd7a:115c:a1e0::2"),
-		User:     ptr.To(users[1]),
-		UserID:   ptr.To(users[1].ID),
+		User:     new(users[1]),
+		UserID:   new(users[1].ID),
 		Tags:     []string{"tag:server"},
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
@@ -832,8 +837,8 @@ func TestAutogroupSelfSymmetricVisibility(t *testing.T) {
 		Hostname: "device-a",
 		IPv4:     ap("100.64.0.1"),
 		IPv6:     ap("fd7a:115c:a1e0::1"),
-		User:     ptr.To(users[0]),
-		UserID:   ptr.To(users[0].ID),
+		User:     new(users[0]),
+		UserID:   new(users[0].ID),
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
 
@@ -843,8 +848,8 @@ func TestAutogroupSelfSymmetricVisibility(t *testing.T) {
 		Hostname: "device-b",
 		IPv4:     ap("100.64.0.2"),
 		IPv6:     ap("fd7a:115c:a1e0::2"),
-		User:     ptr.To(users[1]),
-		UserID:   ptr.To(users[1].ID),
+		User:     new(users[1]),
+		UserID:   new(users[1].ID),
 		Tags:     []string{"tag:web"},
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
@@ -922,8 +927,8 @@ func TestAutogroupSelfDoesNotBreakOtherUsersAccess(t *testing.T) {
 	superadminDevice := &types.Node{
 		ID:       1,
 		Hostname: "superadmin-laptop",
-		User:     ptr.To(users[0]),
-		UserID:   ptr.To(users[0].ID),
+		User:     new(users[0]),
+		UserID:   new(users[0].ID),
 		IPv4:     ap("100.64.0.1"),
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
@@ -931,8 +936,8 @@ func TestAutogroupSelfDoesNotBreakOtherUsersAccess(t *testing.T) {
 	adminDevice := &types.Node{
 		ID:       2,
 		Hostname: "admin-laptop",
-		User:     ptr.To(users[1]),
-		UserID:   ptr.To(users[1].ID),
+		User:     new(users[1]),
+		UserID:   new(users[1].ID),
 		IPv4:     ap("100.64.0.2"),
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
@@ -940,8 +945,8 @@ func TestAutogroupSelfDoesNotBreakOtherUsersAccess(t *testing.T) {
 	directionDevice := &types.Node{
 		ID:       3,
 		Hostname: "direction-laptop",
-		User:     ptr.To(users[2]),
-		UserID:   ptr.To(users[2].ID),
+		User:     new(users[2]),
+		UserID:   new(users[2].ID),
 		IPv4:     ap("100.64.0.3"),
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
@@ -949,8 +954,8 @@ func TestAutogroupSelfDoesNotBreakOtherUsersAccess(t *testing.T) {
 	commonServer := &types.Node{
 		ID:       4,
 		Hostname: "common-server",
-		User:     ptr.To(users[3]),
-		UserID:   ptr.To(users[3].ID),
+		User:     new(users[3]),
+		UserID:   new(users[3].ID),
 		IPv4:     ap("100.64.0.4"),
 		Tags:     []string{"tag:common"},
 		Hostinfo: &tailcfg.Hostinfo{},
@@ -959,8 +964,8 @@ func TestAutogroupSelfDoesNotBreakOtherUsersAccess(t *testing.T) {
 	techServer := &types.Node{
 		ID:       5,
 		Hostname: "tech-server",
-		User:     ptr.To(users[3]),
-		UserID:   ptr.To(users[3].ID),
+		User:     new(users[3]),
+		UserID:   new(users[3].ID),
 		IPv4:     ap("100.64.0.5"),
 		Tags:     []string{"tag:tech"},
 		Hostinfo: &tailcfg.Hostinfo{},
@@ -969,8 +974,8 @@ func TestAutogroupSelfDoesNotBreakOtherUsersAccess(t *testing.T) {
 	privilegedServer := &types.Node{
 		ID:       6,
 		Hostname: "privileged-server",
-		User:     ptr.To(users[3]),
-		UserID:   ptr.To(users[3].ID),
+		User:     new(users[3]),
+		UserID:   new(users[3].ID),
 		IPv4:     ap("100.64.0.6"),
 		Tags:     []string{"tag:privileged"},
 		Hostinfo: &tailcfg.Hostinfo{},
@@ -1082,8 +1087,8 @@ func TestEmptyFilterNodesStillVisible(t *testing.T) {
 	adminDevice := &types.Node{
 		ID:       1,
 		Hostname: "admin-laptop",
-		User:     ptr.To(users[0]),
-		UserID:   ptr.To(users[0].ID),
+		User:     new(users[0]),
+		UserID:   new(users[0].ID),
 		IPv4:     ap("100.64.0.1"),
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
@@ -1093,8 +1098,8 @@ func TestEmptyFilterNodesStillVisible(t *testing.T) {
 	taggedServer := &types.Node{
 		ID:       2,
 		Hostname: "server",
-		User:     ptr.To(users[1]),
-		UserID:   ptr.To(users[1].ID),
+		User:     new(users[1]),
+		UserID:   new(users[1].ID),
 		IPv4:     ap("100.64.0.2"),
 		Tags:     []string{"tag:server"},
 		Hostinfo: &tailcfg.Hostinfo{},
@@ -1151,8 +1156,8 @@ func TestAutogroupSelfCombinedWithTags(t *testing.T) {
 	adminLaptop := &types.Node{
 		ID:       1,
 		Hostname: "admin-laptop",
-		User:     ptr.To(users[0]),
-		UserID:   ptr.To(users[0].ID),
+		User:     new(users[0]),
+		UserID:   new(users[0].ID),
 		IPv4:     ap("100.64.0.1"),
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
@@ -1160,8 +1165,8 @@ func TestAutogroupSelfCombinedWithTags(t *testing.T) {
 	adminPhone := &types.Node{
 		ID:       2,
 		Hostname: "admin-phone",
-		User:     ptr.To(users[0]),
-		UserID:   ptr.To(users[0].ID),
+		User:     new(users[0]),
+		UserID:   new(users[0].ID),
 		IPv4:     ap("100.64.0.2"),
 		Hostinfo: &tailcfg.Hostinfo{},
 	}
@@ -1170,8 +1175,8 @@ func TestAutogroupSelfCombinedWithTags(t *testing.T) {
 	webServer := &types.Node{
 		ID:       3,
 		Hostname: "web-server",
-		User:     ptr.To(users[1]),
-		UserID:   ptr.To(users[1].ID),
+		User:     new(users[1]),
+		UserID:   new(users[1].ID),
 		IPv4:     ap("100.64.0.3"),
 		Tags:     []string{"tag:web"},
 		Hostinfo: &tailcfg.Hostinfo{},
@@ -1246,8 +1251,8 @@ func TestIssue2990SameUserTaggedDevice(t *testing.T) {
 	node1 := &types.Node{
 		ID:       1,
 		Hostname: "node1",
-		User:     ptr.To(users[0]),
-		UserID:   ptr.To(users[0].ID),
+		User:     new(users[0]),
+		UserID:   new(users[0].ID),
 		IPv4:     ap("100.64.0.1"),
 		IPv6:     ap("fd7a:115c:a1e0::1"),
 		Hostinfo: &tailcfg.Hostinfo{},
@@ -1257,8 +1262,8 @@ func TestIssue2990SameUserTaggedDevice(t *testing.T) {
 	node2 := &types.Node{
 		ID:       2,
 		Hostname: "node2",
-		User:     ptr.To(users[0]),
-		UserID:   ptr.To(users[0].ID),
+		User:     new(users[0]),
+		UserID:   new(users[0].ID),
 		IPv4:     ap("100.64.0.2"),
 		IPv6:     ap("fd7a:115c:a1e0::2"),
 		Tags:     []string{"tag:admin"},

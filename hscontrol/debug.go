@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/arl/statsviz"
-	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"tailscale.com/tsweb"
@@ -25,34 +24,39 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 
 		if wantsJSON {
 			overview := h.state.DebugOverviewJSON()
+
 			overviewJSON, err := json.MarshalIndent(overview, "", "  ")
 			if err != nil {
 				httpError(w, err)
 				return
 			}
+
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			w.Write(overviewJSON)
+			_, _ = w.Write(overviewJSON)
 		} else {
 			// Default to text/plain for backward compatibility
 			overview := h.state.DebugOverview()
+
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(overview))
+			_, _ = w.Write([]byte(overview))
 		}
 	}))
 
 	// Configuration endpoint
 	debug.Handle("config", "Current configuration", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		config := h.state.DebugConfig()
+
 		configJSON, err := json.MarshalIndent(config, "", "  ")
 		if err != nil {
 			httpError(w, err)
 			return
 		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write(configJSON)
+		_, _ = w.Write(configJSON)
 	}))
 
 	// Policy endpoint
@@ -70,8 +74,9 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 		} else {
 			w.Header().Set("Content-Type", "text/plain")
 		}
+
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(policy))
+		_, _ = w.Write([]byte(policy))
 	}))
 
 	// Filter rules endpoint
@@ -81,27 +86,31 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 			httpError(w, err)
 			return
 		}
+
 		filterJSON, err := json.MarshalIndent(filter, "", "  ")
 		if err != nil {
 			httpError(w, err)
 			return
 		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write(filterJSON)
+		_, _ = w.Write(filterJSON)
 	}))
 
 	// SSH policies endpoint
 	debug.Handle("ssh", "SSH policies per node", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sshPolicies := h.state.DebugSSHPolicies()
+
 		sshJSON, err := json.MarshalIndent(sshPolicies, "", "  ")
 		if err != nil {
 			httpError(w, err)
 			return
 		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write(sshJSON)
+		_, _ = w.Write(sshJSON)
 	}))
 
 	// DERP map endpoint
@@ -112,20 +121,23 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 
 		if wantsJSON {
 			derpInfo := h.state.DebugDERPJSON()
+
 			derpJSON, err := json.MarshalIndent(derpInfo, "", "  ")
 			if err != nil {
 				httpError(w, err)
 				return
 			}
+
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			w.Write(derpJSON)
+			_, _ = w.Write(derpJSON)
 		} else {
 			// Default to text/plain for backward compatibility
 			derpInfo := h.state.DebugDERPMap()
+
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(derpInfo))
+			_, _ = w.Write([]byte(derpInfo))
 		}
 	}))
 
@@ -137,34 +149,39 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 
 		if wantsJSON {
 			nodeStoreNodes := h.state.DebugNodeStoreJSON()
+
 			nodeStoreJSON, err := json.MarshalIndent(nodeStoreNodes, "", "  ")
 			if err != nil {
 				httpError(w, err)
 				return
 			}
+
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			w.Write(nodeStoreJSON)
+			_, _ = w.Write(nodeStoreJSON)
 		} else {
 			// Default to text/plain for backward compatibility
 			nodeStoreInfo := h.state.DebugNodeStore()
+
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(nodeStoreInfo))
+			_, _ = w.Write([]byte(nodeStoreInfo))
 		}
 	}))
 
 	// Registration cache endpoint
 	debug.Handle("registration-cache", "Registration cache information", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cacheInfo := h.state.DebugRegistrationCache()
+
 		cacheJSON, err := json.MarshalIndent(cacheInfo, "", "  ")
 		if err != nil {
 			httpError(w, err)
 			return
 		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write(cacheJSON)
+		_, _ = w.Write(cacheJSON)
 	}))
 
 	// Routes endpoint
@@ -175,20 +192,23 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 
 		if wantsJSON {
 			routes := h.state.DebugRoutes()
+
 			routesJSON, err := json.MarshalIndent(routes, "", "  ")
 			if err != nil {
 				httpError(w, err)
 				return
 			}
+
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			w.Write(routesJSON)
+			_, _ = w.Write(routesJSON)
 		} else {
 			// Default to text/plain for backward compatibility
 			routes := h.state.DebugRoutesString()
+
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(routes))
+			_, _ = w.Write([]byte(routes))
 		}
 	}))
 
@@ -200,20 +220,23 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 
 		if wantsJSON {
 			policyManagerInfo := h.state.DebugPolicyManagerJSON()
+
 			policyManagerJSON, err := json.MarshalIndent(policyManagerInfo, "", "  ")
 			if err != nil {
 				httpError(w, err)
 				return
 			}
+
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			w.Write(policyManagerJSON)
+			_, _ = w.Write(policyManagerJSON)
 		} else {
 			// Default to text/plain for backward compatibility
 			policyManagerInfo := h.state.DebugPolicyManager()
+
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(policyManagerInfo))
+			_, _ = w.Write([]byte(policyManagerInfo))
 		}
 	}))
 
@@ -226,7 +249,8 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 
 		if res == nil {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("HEADSCALE_DEBUG_DUMP_MAPRESPONSE_PATH not set"))
+			_, _ = w.Write([]byte("HEADSCALE_DEBUG_DUMP_MAPRESPONSE_PATH not set"))
+
 			return
 		}
 
@@ -235,9 +259,10 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 			httpError(w, err)
 			return
 		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write(resJSON)
+		_, _ = w.Write(resJSON)
 	}))
 
 	// Batcher endpoint
@@ -257,14 +282,14 @@ func (h *Headscale) debugHTTPServer() *http.Server {
 
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			w.Write(batcherJSON)
+			_, _ = w.Write(batcherJSON)
 		} else {
 			// Default to text/plain for backward compatibility
 			batcherInfo := h.debugBatcher()
 
 			w.Header().Set("Content-Type", "text/plain")
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(batcherInfo))
+			_, _ = w.Write([]byte(batcherInfo))
 		}
 	}))
 
@@ -303,35 +328,18 @@ func (h *Headscale) debugBatcher() string {
 
 	var nodes []nodeStatus
 
-	// Try to get detailed debug info if we have a LockFreeBatcher
-	if batcher, ok := h.mapBatcher.(*mapper.LockFreeBatcher); ok {
-		debugInfo := batcher.Debug()
-		for nodeID, info := range debugInfo {
-			nodes = append(nodes, nodeStatus{
-				id:                nodeID,
-				connected:         info.Connected,
-				activeConnections: info.ActiveConnections,
-			})
-			totalNodes++
-			if info.Connected {
-				connectedCount++
-			}
-		}
-	} else {
-		// Fallback to basic connection info
-		connectedMap := h.mapBatcher.ConnectedMap()
-		connectedMap.Range(func(nodeID types.NodeID, connected bool) bool {
-			nodes = append(nodes, nodeStatus{
-				id:                nodeID,
-				connected:         connected,
-				activeConnections: 0,
-			})
-			totalNodes++
-			if connected {
-				connectedCount++
-			}
-			return true
+	debugInfo := h.mapBatcher.Debug()
+	for nodeID, info := range debugInfo {
+		nodes = append(nodes, nodeStatus{
+			id:                nodeID,
+			connected:         info.Connected,
+			activeConnections: info.ActiveConnections,
 		})
+		totalNodes++
+
+		if info.Connected {
+			connectedCount++
+		}
 	}
 
 	// Sort by node ID
@@ -381,27 +389,13 @@ func (h *Headscale) debugBatcherJSON() DebugBatcherInfo {
 		TotalNodes:     0,
 	}
 
-	// Try to get detailed debug info if we have a LockFreeBatcher
-	if batcher, ok := h.mapBatcher.(*mapper.LockFreeBatcher); ok {
-		debugInfo := batcher.Debug()
-		for nodeID, debugData := range debugInfo {
-			info.ConnectedNodes[fmt.Sprintf("%d", nodeID)] = DebugBatcherNodeInfo{
-				Connected:         debugData.Connected,
-				ActiveConnections: debugData.ActiveConnections,
-			}
-			info.TotalNodes++
+	debugInfo := h.mapBatcher.Debug()
+	for nodeID, debugData := range debugInfo {
+		info.ConnectedNodes[fmt.Sprintf("%d", nodeID)] = DebugBatcherNodeInfo{
+			Connected:         debugData.Connected,
+			ActiveConnections: debugData.ActiveConnections,
 		}
-	} else {
-		// Fallback to basic connection info
-		connectedMap := h.mapBatcher.ConnectedMap()
-		connectedMap.Range(func(nodeID types.NodeID, connected bool) bool {
-			info.ConnectedNodes[fmt.Sprintf("%d", nodeID)] = DebugBatcherNodeInfo{
-				Connected:         connected,
-				ActiveConnections: 0,
-			}
-			info.TotalNodes++
-			return true
-		})
+		info.TotalNodes++
 	}
 
 	return info

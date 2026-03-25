@@ -67,6 +67,8 @@ For NixOS users, a module is available in [`nix/`](./nix/).
 
 ## Talks
 
+- Fosdem 2026 (video): [Headscale & Tailscale: The complementary open source clone](https://fosdem.org/2026/schedule/event/KYQ3LL-headscale-the-complementary-open-source-clone/)
+  - presented by Kristoffer Dalby
 - Fosdem 2023 (video): [Headscale: How we are using integration testing to reimplement Tailscale](https://fosdem.org/2023/schedule/event/goheadscale/)
   - presented by Juan Font Alonso and Kristoffer Dalby
 
@@ -104,6 +106,8 @@ run `make lint` and `make fmt` before committing any code.
 
 The **Proto** code is linted with [`buf`](https://docs.buf.build/lint/overview) and
 formatted with [`clang-format`](https://clang.llvm.org/docs/ClangFormat.html).
+
+The **docs** are formatted with [`mdformat`](https://mdformat.readthedocs.io).
 
 The **rest** (Markdown, YAML, etc) is formatted with [`prettier`](https://prettier.io).
 

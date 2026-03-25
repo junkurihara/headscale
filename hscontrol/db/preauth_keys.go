@@ -138,8 +138,8 @@ func CreatePreAuthKey(
 		Hash:       hash,    // Store hash
 	}
 
-	if err := tx.Save(&key).Error; err != nil {
-		return nil, fmt.Errorf("failed to create key in the database: %w", err)
+	if err := tx.Save(&key).Error; err != nil { //nolint:noinlineerr
+		return nil, fmt.Errorf("creating key in database: %w", err)
 	}
 
 	return &types.PreAuthKeyNew{
@@ -155,9 +155,7 @@ func CreatePreAuthKey(
 }
 
 func (hsdb *HSDatabase) ListPreAuthKeys() ([]types.PreAuthKey, error) {
-	return Read(hsdb.DB, func(rx *gorm.DB) ([]types.PreAuthKey, error) {
-		return ListPreAuthKeys(rx)
-	})
+	return Read(hsdb.DB, ListPreAuthKeys)
 }
 
 // ListPreAuthKeys returns all PreAuthKeys in the database.
@@ -296,7 +294,7 @@ func DestroyPreAuthKey(tx *gorm.DB, id uint64) error {
 			Where("auth_key_id = ?", id).
 			Update("auth_key_id", nil).Error
 		if err != nil {
-			return fmt.Errorf("failed to clear auth_key_id on nodes: %w", err)
+			return fmt.Errorf("clearing auth_key_id on nodes: %w", err)
 		}
 
 		// Then delete the pre-auth key
@@ -325,14 +323,15 @@ func (hsdb *HSDatabase) DeletePreAuthKey(id uint64) error {
 func UsePreAuthKey(tx *gorm.DB, k *types.PreAuthKey) error {
 	err := tx.Model(k).Update("used", true).Error
 	if err != nil {
-		return fmt.Errorf("failed to update key used status in the database: %w", err)
+		return fmt.Errorf("updating key used status in database: %w", err)
 	}
 
 	k.Used = true
+
 	return nil
 }
 
-// MarkExpirePreAuthKey marks a PreAuthKey as expired.
+// ExpirePreAuthKey marks a PreAuthKey as expired.
 func ExpirePreAuthKey(tx *gorm.DB, id uint64) error {
 	now := time.Now()
 	return tx.Model(&types.PreAuthKey{}).Where("id = ?", id).Update("expiration", now).Error

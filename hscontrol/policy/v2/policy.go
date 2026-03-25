@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/policy/policyutil"
@@ -111,6 +112,7 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 		Filter: filter,
 		Policy: pm.pol,
 	})
+
 	filterChanged := filterHash != pm.filterHash
 	if filterChanged {
 		log.Debug().
@@ -120,7 +122,9 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 			Int("filter.rules.new", len(filter)).
 			Msg("Policy filter hash changed")
 	}
+
 	pm.filter = filter
+
 	pm.filterHash = filterHash
 	if filterChanged {
 		pm.matchers = matcher.MatchesFromFilterRules(pm.filter)
@@ -135,6 +139,7 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	}
 
 	tagOwnerMapHash := deephash.Hash(&tagMap)
+
 	tagOwnerChanged := tagOwnerMapHash != pm.tagOwnerMapHash
 	if tagOwnerChanged {
 		log.Debug().
@@ -144,6 +149,7 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 			Int("tagOwners.new", len(tagMap)).
 			Msg("Tag owner hash changed")
 	}
+
 	pm.tagOwnerMap = tagMap
 	pm.tagOwnerMapHash = tagOwnerMapHash
 
@@ -153,6 +159,7 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	}
 
 	autoApproveMapHash := deephash.Hash(&autoMap)
+
 	autoApproveChanged := autoApproveMapHash != pm.autoApproveMapHash
 	if autoApproveChanged {
 		log.Debug().
@@ -162,10 +169,12 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 			Int("autoApprovers.new", len(autoMap)).
 			Msg("Auto-approvers hash changed")
 	}
+
 	pm.autoApproveMap = autoMap
 	pm.autoApproveMapHash = autoApproveMapHash
 
 	exitSetHash := deephash.Hash(&exitSet)
+
 	exitSetChanged := exitSetHash != pm.exitSetHash
 	if exitSetChanged {
 		log.Debug().
@@ -173,6 +182,7 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 			Str("exitSet.hash.new", exitSetHash.String()[:8]).
 			Msg("Exit node set hash changed")
 	}
+
 	pm.exitSet = exitSet
 	pm.exitSetHash = exitSetHash
 
@@ -199,6 +209,7 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	if !needsUpdate {
 		log.Trace().
 			Msg("Policy evaluation detected no changes - all hashes match")
+
 		return false, nil
 	}
 
@@ -212,7 +223,7 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	return true, nil
 }
 
-func (pm *PolicyManager) SSHPolicy(node types.NodeView) (*tailcfg.SSHPolicy, error) {
+func (pm *PolicyManager) SSHPolicy(baseURL string, node types.NodeView) (*tailcfg.SSHPolicy, error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -220,13 +231,92 @@ func (pm *PolicyManager) SSHPolicy(node types.NodeView) (*tailcfg.SSHPolicy, err
 		return sshPol, nil
 	}
 
-	sshPol, err := pm.pol.compileSSHPolicy(pm.users, node, pm.nodes)
+	sshPol, err := pm.pol.compileSSHPolicy(baseURL, pm.users, node, pm.nodes)
 	if err != nil {
 		return nil, fmt.Errorf("compiling SSH policy: %w", err)
 	}
+
 	pm.sshPolicyMap[node.ID()] = sshPol
 
 	return sshPol, nil
+}
+
+// SSHCheckParams resolves the SSH check period for a source-destination
+// node pair by looking up the current policy. This avoids trusting URL
+// parameters that a client could tamper with.
+// It returns the check period duration and whether a matching check
+// rule was found.
+func (pm *PolicyManager) SSHCheckParams(
+	srcNodeID, dstNodeID types.NodeID,
+) (time.Duration, bool) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if pm.pol == nil || len(pm.pol.SSHs) == 0 {
+		return 0, false
+	}
+
+	// Find the source and destination node views.
+	var srcNode, dstNode types.NodeView
+
+	for _, n := range pm.nodes.All() {
+		nid := n.ID()
+		if nid == srcNodeID {
+			srcNode = n
+		}
+
+		if nid == dstNodeID {
+			dstNode = n
+		}
+
+		if srcNode.Valid() && dstNode.Valid() {
+			break
+		}
+	}
+
+	if !srcNode.Valid() || !dstNode.Valid() {
+		return 0, false
+	}
+
+	// Iterate SSH rules to find the first matching check rule.
+	for _, rule := range pm.pol.SSHs {
+		if rule.Action != SSHActionCheck {
+			continue
+		}
+
+		// Resolve sources and check if src node matches.
+		srcIPs, err := rule.Sources.Resolve(pm.pol, pm.users, pm.nodes)
+		if err != nil || srcIPs == nil {
+			continue
+		}
+
+		if !slices.ContainsFunc(srcNode.IPs(), srcIPs.Contains) {
+			continue
+		}
+
+		// Check if dst node matches any destination.
+		for _, dst := range rule.Destinations {
+			if ag, isAG := dst.(*AutoGroup); isAG && ag.Is(AutoGroupSelf) {
+				if !srcNode.IsTagged() && !dstNode.IsTagged() &&
+					srcNode.User().ID() == dstNode.User().ID() {
+					return checkPeriodFromRule(rule), true
+				}
+
+				continue
+			}
+
+			dstIPs, err := dst.Resolve(pm.pol, pm.users, pm.nodes)
+			if err != nil || dstIPs == nil {
+				continue
+			}
+
+			if slices.ContainsFunc(dstNode.IPs(), dstIPs.Contains) {
+				return checkPeriodFromRule(rule), true
+			}
+		}
+	}
+
+	return 0, false
 }
 
 func (pm *PolicyManager) SetPolicy(polB []byte) (bool, error) {
@@ -403,6 +493,7 @@ func (pm *PolicyManager) filterForNodeLocked(node types.NodeView) ([]tailcfg.Fil
 		reducedFilter := policyutil.ReduceFilterRules(node, pm.filter)
 
 		pm.filterRulesMap[node.ID()] = reducedFilter
+
 		return reducedFilter, nil
 	}
 
@@ -447,7 +538,7 @@ func (pm *PolicyManager) FilterForNode(node types.NodeView) ([]tailcfg.FilterRul
 // This is different from FilterForNode which returns REDUCED rules for packet filtering.
 //
 // For global policies: returns the global matchers (same for all nodes)
-// For autogroup:self: returns node-specific matchers from unreduced compiled rules
+// For autogroup:self: returns node-specific matchers from unreduced compiled rules.
 func (pm *PolicyManager) MatchersForNode(node types.NodeView) ([]matcher.Match, error) {
 	if pm == nil {
 		return nil, nil
@@ -479,6 +570,7 @@ func (pm *PolicyManager) SetUsers(users []types.User) (bool, error) {
 
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+
 	pm.users = users
 
 	// Clear SSH policy map when users change to force SSH policy recomputation
@@ -690,6 +782,7 @@ func (pm *PolicyManager) NodeCanApproveRoute(node types.NodeView, route netip.Pr
 		if pm.exitSet == nil {
 			return false
 		}
+
 		if slices.ContainsFunc(node.IPs(), pm.exitSet.Contains) {
 			return true
 		}
@@ -753,8 +846,10 @@ func (pm *PolicyManager) DebugString() string {
 	}
 
 	fmt.Fprintf(&sb, "AutoApprover (%d):\n", len(pm.autoApproveMap))
+
 	for prefix, approveAddrs := range pm.autoApproveMap {
 		fmt.Fprintf(&sb, "\t%s:\n", prefix)
+
 		for _, iprange := range approveAddrs.Ranges() {
 			fmt.Fprintf(&sb, "\t\t%s\n", iprange)
 		}
@@ -763,14 +858,17 @@ func (pm *PolicyManager) DebugString() string {
 	sb.WriteString("\n\n")
 
 	fmt.Fprintf(&sb, "TagOwner (%d):\n", len(pm.tagOwnerMap))
+
 	for prefix, tagOwners := range pm.tagOwnerMap {
 		fmt.Fprintf(&sb, "\t%s:\n", prefix)
+
 		for _, iprange := range tagOwners.Ranges() {
 			fmt.Fprintf(&sb, "\t\t%s\n", iprange)
 		}
 	}
 
 	sb.WriteString("\n\n")
+
 	if pm.filter != nil {
 		filter, err := json.MarshalIndent(pm.filter, "", "  ")
 		if err == nil {
@@ -783,6 +881,7 @@ func (pm *PolicyManager) DebugString() string {
 	sb.WriteString("\n\n")
 	sb.WriteString("Matchers:\n")
 	sb.WriteString("an internal structure used to filter nodes and routes\n")
+
 	for _, match := range pm.matchers {
 		sb.WriteString(match.DebugString())
 		sb.WriteString("\n")
@@ -790,6 +889,7 @@ func (pm *PolicyManager) DebugString() string {
 
 	sb.WriteString("\n\n")
 	sb.WriteString("Nodes:\n")
+
 	for _, node := range pm.nodes.All() {
 		sb.WriteString(node.String())
 		sb.WriteString("\n")
@@ -867,6 +967,7 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 
 			// Check if IPs changed (simple check - could be more sophisticated)
 			oldIPs := oldNode.IPs()
+
 			newIPs := newNode.IPs()
 			if len(oldIPs) != len(newIPs) {
 				affectedUsers[newNode.User().ID()] = struct{}{}
@@ -888,6 +989,7 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 	for nodeID := range pm.filterRulesMap {
 		// Find the user for this cached node
 		var nodeUserID uint
+
 		found := false
 
 		// Check in new nodes first
@@ -899,8 +1001,10 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 					found = true
 					break
 				}
+
 				nodeUserID = node.User().ID()
 				found = true
+
 				break
 			}
 		}
@@ -913,8 +1017,10 @@ func (pm *PolicyManager) invalidateAutogroupSelfCache(oldNodes, newNodes views.S
 						found = true
 						break
 					}
+
 					nodeUserID = node.User().ID()
 					found = true
+
 					break
 				}
 			}

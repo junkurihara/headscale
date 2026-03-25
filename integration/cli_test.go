@@ -58,7 +58,7 @@ func TestUserCommand(t *testing.T) {
 	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
-	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clins"))
+	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("cli-user"))
 	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
@@ -203,7 +203,7 @@ func TestUserCommand(t *testing.T) {
 			"--identifier=1",
 		},
 	)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Contains(t, deleteResult, "User destroyed")
 
 	var listAfterIDDelete []*v1.User
@@ -245,7 +245,7 @@ func TestUserCommand(t *testing.T) {
 			"--name=newname",
 		},
 	)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Contains(t, deleteResult, "User destroyed")
 
 	var listAfterNameDelete []v1.User
@@ -571,7 +571,9 @@ func TestPreAuthKeyCommandReusableEphemeral(t *testing.T) {
 func TestPreAuthKeyCorrectUserLoggedInCommand(t *testing.T) {
 	IntegrationSkip(t)
 
+	//nolint:goconst // test data, not worth extracting
 	user1 := "user1"
+	//nolint:goconst // test data, not worth extracting
 	user2 := "user2"
 
 	spec := ScenarioSpec{
@@ -586,9 +588,7 @@ func TestPreAuthKeyCorrectUserLoggedInCommand(t *testing.T) {
 
 	err = scenario.CreateHeadscaleEnv(
 		[]tsic.Option{},
-		hsic.WithTestName("clipak"),
-		hsic.WithEmbeddedDERPServerOnly(),
-		hsic.WithTLS(),
+		hsic.WithTestName("cli-paklogin"),
 	)
 	require.NoError(t, err)
 
@@ -697,8 +697,6 @@ func TestTaggedNodesCLIOutput(t *testing.T) {
 	err = scenario.CreateHeadscaleEnv(
 		[]tsic.Option{},
 		hsic.WithTestName("tagcli"),
-		hsic.WithEmbeddedDERPServerOnly(),
-		hsic.WithTLS(),
 	)
 	require.NoError(t, err)
 
@@ -809,7 +807,7 @@ func TestApiKeyCommand(t *testing.T) {
 	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
-	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clins"))
+	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("cli-apikey"))
 	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
@@ -829,7 +827,7 @@ func TestApiKeyCommand(t *testing.T) {
 				"json",
 			},
 		)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.NotEmpty(t, apiResult)
 
 		keys[idx] = apiResult
@@ -907,7 +905,7 @@ func TestApiKeyCommand(t *testing.T) {
 				listedAPIKeys[idx].GetPrefix(),
 			},
 		)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		expiredPrefixes[listedAPIKeys[idx].GetPrefix()] = true
 	}
@@ -952,7 +950,7 @@ func TestApiKeyCommand(t *testing.T) {
 			"--prefix",
 			listedAPIKeys[0].GetPrefix(),
 		})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	var listedAPIKeysAfterDelete []v1.ApiKey
 
@@ -1056,22 +1054,22 @@ func TestNodeCommand(t *testing.T) {
 	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
-	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clins"))
+	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("cli-node"))
 	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
 	require.NoError(t, err)
 
 	regIDs := []string{
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
+		types.MustAuthID().String(),
+		types.MustAuthID().String(),
+		types.MustAuthID().String(),
+		types.MustAuthID().String(),
+		types.MustAuthID().String(),
 	}
 	nodes := make([]*v1.Node, len(regIDs))
 
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	for index, regID := range regIDs {
 		_, err := headscale.Execute(
@@ -1089,7 +1087,7 @@ func TestNodeCommand(t *testing.T) {
 				"json",
 			},
 		)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		var node v1.Node
 
@@ -1098,11 +1096,11 @@ func TestNodeCommand(t *testing.T) {
 				headscale,
 				[]string{
 					"headscale",
-					"nodes",
+					"auth",
+					"register",
 					"--user",
 					"node-user",
-					"register",
-					"--key",
+					"--auth-id",
 					regID,
 					"--output",
 					"json",
@@ -1151,12 +1149,12 @@ func TestNodeCommand(t *testing.T) {
 	assert.Equal(t, "node-5", listAll[4].GetName())
 
 	otherUserRegIDs := []string{
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
+		types.MustAuthID().String(),
+		types.MustAuthID().String(),
 	}
 	otherUserMachines := make([]*v1.Node, len(otherUserRegIDs))
 
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	for index, regID := range otherUserRegIDs {
 		_, err := headscale.Execute(
@@ -1174,7 +1172,7 @@ func TestNodeCommand(t *testing.T) {
 				"json",
 			},
 		)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		var node v1.Node
 
@@ -1183,11 +1181,11 @@ func TestNodeCommand(t *testing.T) {
 				headscale,
 				[]string{
 					"headscale",
-					"nodes",
+					"auth",
+					"register",
 					"--user",
 					"other-user",
-					"register",
-					"--key",
+					"--auth-id",
 					regID,
 					"--output",
 					"json",
@@ -1281,7 +1279,7 @@ func TestNodeCommand(t *testing.T) {
 			"--force",
 		},
 	)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Test: list main user after node is deleted
 	var listOnlyMachineUserAfterDelete []v1.Node
@@ -1317,18 +1315,18 @@ func TestNodeExpireCommand(t *testing.T) {
 	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
-	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clins"))
+	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("cli-nodeexpire"))
 	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
 	require.NoError(t, err)
 
 	regIDs := []string{
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
+		types.MustAuthID().String(),
+		types.MustAuthID().String(),
+		types.MustAuthID().String(),
+		types.MustAuthID().String(),
+		types.MustAuthID().String(),
 	}
 	nodes := make([]*v1.Node, len(regIDs))
 
@@ -1348,7 +1346,7 @@ func TestNodeExpireCommand(t *testing.T) {
 				"json",
 			},
 		)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		var node v1.Node
 
@@ -1357,11 +1355,11 @@ func TestNodeExpireCommand(t *testing.T) {
 				headscale,
 				[]string{
 					"headscale",
-					"nodes",
+					"auth",
+					"register",
 					"--user",
 					"node-expire-user",
-					"register",
-					"--key",
+					"--auth-id",
 					regID,
 					"--output",
 					"json",
@@ -1411,7 +1409,7 @@ func TestNodeExpireCommand(t *testing.T) {
 				strconv.FormatUint(listAll[idx].GetId(), 10),
 			},
 		)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	}
 
 	var listAllAfterExpiry []v1.Node
@@ -1452,22 +1450,22 @@ func TestNodeRenameCommand(t *testing.T) {
 	require.NoError(t, err)
 	defer scenario.ShutdownAssertNoPanics(t)
 
-	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("clins"))
+	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("cli-noderename"))
 	require.NoError(t, err)
 
 	headscale, err := scenario.Headscale()
 	require.NoError(t, err)
 
 	regIDs := []string{
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
-		types.MustRegistrationID().String(),
+		types.MustAuthID().String(),
+		types.MustAuthID().String(),
+		types.MustAuthID().String(),
+		types.MustAuthID().String(),
+		types.MustAuthID().String(),
 	}
 	nodes := make([]*v1.Node, len(regIDs))
 
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	for index, regID := range regIDs {
 		_, err := headscale.Execute(
@@ -1494,11 +1492,11 @@ func TestNodeRenameCommand(t *testing.T) {
 				headscale,
 				[]string{
 					"headscale",
-					"nodes",
+					"auth",
+					"register",
 					"--user",
 					"node-rename-command",
-					"register",
-					"--key",
+					"--auth-id",
 					regID,
 					"--output",
 					"json",
@@ -1549,7 +1547,7 @@ func TestNodeRenameCommand(t *testing.T) {
 				fmt.Sprintf("newnode-%d", idx+1),
 			},
 		)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		assert.Contains(t, res, "Node renamed")
 	}
@@ -1590,7 +1588,7 @@ func TestNodeRenameCommand(t *testing.T) {
 			strings.Repeat("t", 64),
 		},
 	)
-	assert.ErrorContains(t, err, "must not exceed 63 characters")
+	require.ErrorContains(t, err, "must not exceed 63 characters")
 
 	var listAllAfterRenameAttempt []v1.Node
 
@@ -1632,9 +1630,9 @@ func TestPolicyCommand(t *testing.T) {
 
 	err = scenario.CreateHeadscaleEnv(
 		[]tsic.Option{},
-		hsic.WithTestName("clins"),
+		hsic.WithTestName("cli-policy"),
 		hsic.WithConfigEnv(map[string]string{
-			"HEADSCALE_POLICY_MODE": "database",
+			"HEADSCALE_POLICY_MODE": "database", // test sets/gets policy via CLI
 		}),
 	)
 	require.NoError(t, err)
@@ -1658,7 +1656,7 @@ func TestPolicyCommand(t *testing.T) {
 		},
 	}
 
-	pBytes, _ := json.Marshal(p)
+	pBytes, _ := json.Marshal(p) //nolint:errchkjson
 
 	policyFilePath := "/etc/headscale/policy.json"
 
@@ -1717,9 +1715,9 @@ func TestPolicyBrokenConfigCommand(t *testing.T) {
 
 	err = scenario.CreateHeadscaleEnv(
 		[]tsic.Option{},
-		hsic.WithTestName("clins"),
+		hsic.WithTestName("cli-policybad"),
 		hsic.WithConfigEnv(map[string]string{
-			"HEADSCALE_POLICY_MODE": "database",
+			"HEADSCALE_POLICY_MODE": "database", // test sets invalid policy via CLI
 		}),
 	)
 	require.NoError(t, err)
@@ -1745,7 +1743,7 @@ func TestPolicyBrokenConfigCommand(t *testing.T) {
 		},
 	}
 
-	pBytes, _ := json.Marshal(p)
+	pBytes, _ := json.Marshal(p) //nolint:errchkjson
 
 	policyFilePath := "/etc/headscale/policy.json"
 
@@ -1763,7 +1761,7 @@ func TestPolicyBrokenConfigCommand(t *testing.T) {
 			policyFilePath,
 		},
 	)
-	assert.ErrorContains(t, err, `invalid action "unknown-action"`)
+	require.ErrorContains(t, err, `invalid ACL action: "unknown-action"`)
 
 	// The new policy was invalid, the old one should still be in place, which
 	// is none.

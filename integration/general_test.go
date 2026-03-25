@@ -41,8 +41,9 @@ func TestPingAllByIP(t *testing.T) {
 	err = scenario.CreateHeadscaleEnv(
 		[]tsic.Option{},
 		hsic.WithTestName("pingallbyip"),
-		hsic.WithEmbeddedDERPServerOnly(),
-		hsic.WithTLS(),
+		// All other tests use the default sequential allocation.
+		// This test uses random allocation to ensure it does not
+		// break basic connectivity.
 		hsic.WithIPAllocationStrategy(types.IPAllocationStrategyRandom),
 	)
 	requireNoErrHeadscaleEnv(t, err)
@@ -102,6 +103,12 @@ func TestPingAllByIPPublicDERP(t *testing.T) {
 	err = scenario.CreateHeadscaleEnv(
 		[]tsic.Option{},
 		hsic.WithTestName("pingallbyippubderp"),
+		// Explicitly use public DERP relays instead of the embedded
+		// DERP server to verify connectivity through Tailscale's
+		// infrastructure. TLS is disabled because the headscale
+		// server does not need to terminate TLS for this test.
+		hsic.WithPublicDERP(),
+		hsic.WithoutTLS(),
 	)
 	requireNoErrHeadscaleEnv(t, err)
 
@@ -128,6 +135,8 @@ func TestEphemeral(t *testing.T) {
 	testEphemeralWithOptions(t, hsic.WithTestName("ephemeral"))
 }
 
+// TestEphemeralInAlternateTimezone verifies that ephemeral node
+// expiry works correctly when the server runs in a non-UTC timezone.
 func TestEphemeralInAlternateTimezone(t *testing.T) {
 	testEphemeralWithOptions(
 		t,
@@ -387,8 +396,6 @@ func TestTaildrop(t *testing.T) {
 
 	err = scenario.CreateHeadscaleEnv([]tsic.Option{},
 		hsic.WithTestName("taildrop"),
-		hsic.WithEmbeddedDERPServerOnly(),
-		hsic.WithTLS(),
 	)
 	requireNoErrHeadscaleEnv(t, err)
 
@@ -1166,6 +1173,103 @@ func TestSetNodeExpiryInFuture(t *testing.T) {
 	}
 }
 
+// TestDisableNodeExpiry tests disabling key expiry for a node.
+// First sets an expiry, then disables it and verifies the node never expires.
+func TestDisableNodeExpiry(t *testing.T) {
+	IntegrationSkip(t)
+
+	spec := ScenarioSpec{
+		NodesPerUser: len(MustTestVersions),
+		Users:        []string{"user1"},
+	}
+
+	scenario, err := NewScenario(spec)
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("disableexpiry"))
+	requireNoErrHeadscaleEnv(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	requireNoErrSync(t, err)
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+
+	// First set an expiry on the node.
+	result, err := headscale.Execute(
+		[]string{
+			"headscale", "nodes", "expire",
+			"--identifier", "1",
+			"--output", "json",
+			"--expiry", time.Now().Add(time.Hour).Format(time.RFC3339),
+		},
+	)
+	require.NoError(t, err)
+
+	var node v1.Node
+	err = json.Unmarshal([]byte(result), &node)
+	require.NoError(t, err)
+	require.NotNil(t, node.GetExpiry(), "node should have an expiry set")
+
+	// Now disable the expiry.
+	result, err = headscale.Execute(
+		[]string{
+			"headscale", "nodes", "expire",
+			"--identifier", "1",
+			"--output", "json",
+			"--disable",
+		},
+	)
+	require.NoError(t, err)
+
+	var nodeDisabled v1.Node
+	err = json.Unmarshal([]byte(result), &nodeDisabled)
+	require.NoError(t, err)
+
+	// Expiry should be nil (or zero time) when disabled.
+	if nodeDisabled.GetExpiry() != nil {
+		require.True(t, nodeDisabled.GetExpiry().AsTime().IsZero(),
+			"node expiry should be zero/nil after disabling")
+	}
+
+	var nodeKey key.NodePublic
+	err = nodeKey.UnmarshalText([]byte(nodeDisabled.GetNodeKey()))
+	require.NoError(t, err)
+
+	// Verify peers see the node as not expired.
+	for _, client := range allClients {
+		if client.Hostname() == nodeDisabled.GetName() {
+			continue
+		}
+
+		assert.EventuallyWithT(
+			t, func(ct *assert.CollectT) {
+				status, err := client.Status()
+				assert.NoError(ct, err)
+
+				peerStatus, ok := status.Peer[nodeKey]
+				assert.True(ct, ok, "node key should be present in peer list")
+
+				if !ok {
+					return
+				}
+
+				// Node should not be expired.
+				assert.Falsef(
+					ct,
+					peerStatus.Expired,
+					"node %q should not be marked as expired after disabling expiry",
+					peerStatus.HostName,
+				)
+			}, 3*time.Minute, 5*time.Second, "waiting for disabled expiry to propagate",
+		)
+	}
+}
+
 func TestNodeOnlineStatus(t *testing.T) {
 	IntegrationSkip(t)
 
@@ -1306,9 +1410,6 @@ func TestPingAllByIPManyUpDown(t *testing.T) {
 	err = scenario.CreateHeadscaleEnv(
 		[]tsic.Option{},
 		hsic.WithTestName("pingallbyipmany"),
-		hsic.WithEmbeddedDERPServerOnly(),
-		hsic.WithDERPAsIP(),
-		hsic.WithTLS(),
 	)
 	requireNoErrHeadscaleEnv(t, err)
 
@@ -1415,8 +1516,6 @@ func Test2118DeletingOnlineNodePanics(t *testing.T) {
 	err = scenario.CreateHeadscaleEnv(
 		[]tsic.Option{},
 		hsic.WithTestName("deletenocrash"),
-		hsic.WithEmbeddedDERPServerOnly(),
-		hsic.WithTLS(),
 	)
 	requireNoErrHeadscaleEnv(t, err)
 

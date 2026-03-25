@@ -22,7 +22,6 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
-	"tailscale.com/types/ptr"
 )
 
 func TestGetNode(t *testing.T) {
@@ -102,6 +101,8 @@ func TestExpireNode(t *testing.T) {
 	pak, err := db.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
 	require.NoError(t, err)
 
+	pakID := pak.ID
+
 	_, err = db.getNode(types.UserID(user.ID), "testnode")
 	require.Error(t, err)
 
@@ -115,7 +116,7 @@ func TestExpireNode(t *testing.T) {
 		Hostname:       "testnode",
 		UserID:         &user.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
-		AuthKeyID:      ptr.To(pak.ID),
+		AuthKeyID:      &pakID,
 		Expiry:         &time.Time{},
 	}
 	db.DB.Save(node)
@@ -127,13 +128,55 @@ func TestExpireNode(t *testing.T) {
 	assert.False(t, nodeFromDB.IsExpired())
 
 	now := time.Now()
-	err = db.NodeSetExpiry(nodeFromDB.ID, now)
+	err = db.NodeSetExpiry(nodeFromDB.ID, &now)
 	require.NoError(t, err)
 
 	nodeFromDB, err = db.getNode(types.UserID(user.ID), "testnode")
 	require.NoError(t, err)
 
 	assert.True(t, nodeFromDB.IsExpired())
+}
+
+func TestDisableNodeExpiry(t *testing.T) {
+	db, err := newSQLiteTestDB()
+	require.NoError(t, err)
+
+	user, err := db.CreateUser(types.User{Name: "test"})
+	require.NoError(t, err)
+
+	pak, err := db.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
+	require.NoError(t, err)
+
+	pakID := pak.ID
+	node := &types.Node{
+		ID:             0,
+		MachineKey:     key.NewMachine().Public(),
+		NodeKey:        key.NewNode().Public(),
+		Hostname:       "testnode",
+		UserID:         &user.ID,
+		RegisterMethod: util.RegisterMethodAuthKey,
+		AuthKeyID:      &pakID,
+		Expiry:         &time.Time{},
+	}
+	db.DB.Save(node)
+
+	// Set an expiry first.
+	past := time.Now().Add(-time.Hour)
+	err = db.NodeSetExpiry(node.ID, &past)
+	require.NoError(t, err)
+
+	nodeFromDB, err := db.getNode(types.UserID(user.ID), "testnode")
+	require.NoError(t, err)
+	assert.True(t, nodeFromDB.IsExpired(), "node should be expired")
+
+	// Disable expiry by setting nil.
+	err = db.NodeSetExpiry(node.ID, nil)
+	require.NoError(t, err)
+
+	nodeFromDB, err = db.getNode(types.UserID(user.ID), "testnode")
+	require.NoError(t, err)
+	assert.False(t, nodeFromDB.IsExpired(), "node should not be expired after disabling expiry")
+	assert.Nil(t, nodeFromDB.Expiry, "expiry should be nil after disabling")
 }
 
 func TestSetTags(t *testing.T) {
@@ -146,6 +189,8 @@ func TestSetTags(t *testing.T) {
 	pak, err := db.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
 	require.NoError(t, err)
 
+	pakID := pak.ID
+
 	_, err = db.getNode(types.UserID(user.ID), "testnode")
 	require.Error(t, err)
 
@@ -159,7 +204,7 @@ func TestSetTags(t *testing.T) {
 		Hostname:       "testnode",
 		UserID:         &user.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
-		AuthKeyID:      ptr.To(pak.ID),
+		AuthKeyID:      &pakID,
 	}
 
 	trx := db.DB.Save(node)
@@ -187,6 +232,7 @@ func TestHeadscale_generateGivenName(t *testing.T) {
 		suppliedName string
 		randomSuffix bool
 	}
+
 	tests := []struct {
 		name    string
 		args    args
@@ -443,7 +489,7 @@ func TestAutoApproveRoutes(t *testing.T) {
 					Hostinfo: &tailcfg.Hostinfo{
 						RoutableIPs: tt.routes,
 					},
-					IPv4: ptr.To(netip.MustParseAddr("100.64.0.1")),
+					IPv4: new(netip.MustParseAddr("100.64.0.1")),
 				}
 
 				err = adb.DB.Save(&node).Error
@@ -460,17 +506,17 @@ func TestAutoApproveRoutes(t *testing.T) {
 						RoutableIPs: tt.routes,
 					},
 					Tags: []string{"tag:exit"},
-					IPv4: ptr.To(netip.MustParseAddr("100.64.0.2")),
+					IPv4: new(netip.MustParseAddr("100.64.0.2")),
 				}
 
 				err = adb.DB.Save(&nodeTagged).Error
 				require.NoError(t, err)
 
 				users, err := adb.ListUsers()
-				assert.NoError(t, err)
+				require.NoError(t, err)
 
 				nodes, err := adb.ListNodes()
-				assert.NoError(t, err)
+				require.NoError(t, err)
 
 				pm, err := pmf(users, nodes.ViewSlice())
 				require.NoError(t, err)
@@ -498,6 +544,7 @@ func TestAutoApproveRoutes(t *testing.T) {
 				if len(expectedRoutes1) == 0 {
 					expectedRoutes1 = nil
 				}
+
 				if diff := cmp.Diff(expectedRoutes1, node1ByID.AllApprovedRoutes(), util.Comparers...); diff != "" {
 					t.Errorf("unexpected enabled routes (-want +got):\n%s", diff)
 				}
@@ -509,6 +556,7 @@ func TestAutoApproveRoutes(t *testing.T) {
 				if len(expectedRoutes2) == 0 {
 					expectedRoutes2 = nil
 				}
+
 				if diff := cmp.Diff(expectedRoutes2, node2ByID.AllApprovedRoutes(), util.Comparers...); diff != "" {
 					t.Errorf("unexpected enabled routes (-want +got):\n%s", diff)
 				}
@@ -520,6 +568,7 @@ func TestAutoApproveRoutes(t *testing.T) {
 func TestEphemeralGarbageCollectorOrder(t *testing.T) {
 	want := []types.NodeID{1, 3}
 	got := []types.NodeID{}
+
 	var mu sync.Mutex
 
 	deletionCount := make(chan struct{}, 10)
@@ -527,6 +576,7 @@ func TestEphemeralGarbageCollectorOrder(t *testing.T) {
 	e := NewEphemeralGarbageCollector(func(ni types.NodeID) {
 		mu.Lock()
 		defer mu.Unlock()
+
 		got = append(got, ni)
 
 		deletionCount <- struct{}{}
@@ -576,8 +626,10 @@ func TestEphemeralGarbageCollectorOrder(t *testing.T) {
 }
 
 func TestEphemeralGarbageCollectorLoads(t *testing.T) {
-	var got []types.NodeID
-	var mu sync.Mutex
+	var (
+		got []types.NodeID
+		mu  sync.Mutex
+	)
 
 	want := 1000
 
@@ -589,6 +641,7 @@ func TestEphemeralGarbageCollectorLoads(t *testing.T) {
 
 		// Yield to other goroutines to introduce variability
 		runtime.Gosched()
+
 		got = append(got, ni)
 
 		atomic.AddInt64(&deletedCount, 1)
@@ -616,9 +669,12 @@ func TestEphemeralGarbageCollectorLoads(t *testing.T) {
 	}
 }
 
-func generateRandomNumber(t *testing.T, max int64) int64 {
+//nolint:unused
+func generateRandomNumber(t *testing.T, maxVal int64) int64 {
 	t.Helper()
-	maxB := big.NewInt(max)
+
+	maxB := big.NewInt(maxVal)
+
 	n, err := rand.Int(rand.Reader, maxB)
 	if err != nil {
 		t.Fatalf("getting random number: %s", err)
@@ -642,6 +698,9 @@ func TestListEphemeralNodes(t *testing.T) {
 	pakEph, err := db.CreatePreAuthKey(user.TypedID(), false, true, nil, nil)
 	require.NoError(t, err)
 
+	pakID := pak.ID
+	pakEphID := pakEph.ID
+
 	node := types.Node{
 		ID:             0,
 		MachineKey:     key.NewMachine().Public(),
@@ -649,7 +708,7 @@ func TestListEphemeralNodes(t *testing.T) {
 		Hostname:       "test",
 		UserID:         &user.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
-		AuthKeyID:      ptr.To(pak.ID),
+		AuthKeyID:      &pakID,
 	}
 
 	nodeEph := types.Node{
@@ -659,7 +718,7 @@ func TestListEphemeralNodes(t *testing.T) {
 		Hostname:       "ephemeral",
 		UserID:         &user.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
-		AuthKeyID:      ptr.To(pakEph.ID),
+		AuthKeyID:      &pakEphID,
 	}
 
 	err = db.DB.Save(&node).Error
@@ -722,7 +781,7 @@ func TestNodeNaming(t *testing.T) {
 	nodeInvalidHostname := types.Node{
 		MachineKey:     key.NewMachine().Public(),
 		NodeKey:        key.NewNode().Public(),
-		Hostname:       "我的电脑",
+		Hostname:       "我的电脑", //nolint:gosmopolitan // intentional i18n test data
 		UserID:         &user2.ID,
 		RegisterMethod: util.RegisterMethodAuthKey,
 	}
@@ -746,12 +805,15 @@ func TestNodeNaming(t *testing.T) {
 		if err != nil {
 			return err
 		}
+
 		_, err = RegisterNodeForTest(tx, node2, nil, nil)
 		if err != nil {
 			return err
 		}
-		_, err = RegisterNodeForTest(tx, nodeInvalidHostname, ptr.To(mpp("100.64.0.66/32").Addr()), nil)
-		_, err = RegisterNodeForTest(tx, nodeShortHostname, ptr.To(mpp("100.64.0.67/32").Addr()), nil)
+
+		_, _ = RegisterNodeForTest(tx, nodeInvalidHostname, new(mpp("100.64.0.66/32").Addr()), nil)
+		_, err = RegisterNodeForTest(tx, nodeShortHostname, new(mpp("100.64.0.67/32").Addr()), nil)
+
 		return err
 	})
 	require.NoError(t, err)
@@ -810,25 +872,25 @@ func TestNodeNaming(t *testing.T) {
 	err = db.Write(func(tx *gorm.DB) error {
 		return RenameNode(tx, nodes[0].ID, "test")
 	})
-	assert.ErrorContains(t, err, "name is not unique")
+	require.ErrorContains(t, err, "name is not unique")
 
 	// Rename invalid chars
 	err = db.Write(func(tx *gorm.DB) error {
-		return RenameNode(tx, nodes[2].ID, "我的电脑")
+		return RenameNode(tx, nodes[2].ID, "我的电脑") //nolint:gosmopolitan // intentional i18n test data
 	})
-	assert.ErrorContains(t, err, "invalid characters")
+	require.ErrorContains(t, err, "invalid characters")
 
 	// Rename too short
 	err = db.Write(func(tx *gorm.DB) error {
 		return RenameNode(tx, nodes[3].ID, "a")
 	})
-	assert.ErrorContains(t, err, "at least 2 characters")
+	require.ErrorContains(t, err, "at least 2 characters")
 
 	// Rename with emoji
 	err = db.Write(func(tx *gorm.DB) error {
 		return RenameNode(tx, nodes[0].ID, "hostname-with-💩")
 	})
-	assert.ErrorContains(t, err, "invalid characters")
+	require.ErrorContains(t, err, "invalid characters")
 
 	// Rename with only emoji
 	err = db.Write(func(tx *gorm.DB) error {
@@ -896,12 +958,12 @@ func TestRenameNodeComprehensive(t *testing.T) {
 		},
 		{
 			name:    "chinese_chars_with_dash_rejected",
-			newName: "server-北京-01",
+			newName: "server-北京-01", //nolint:gosmopolitan // intentional i18n test data
 			wantErr: "invalid characters",
 		},
 		{
 			name:    "chinese_only_rejected",
-			newName: "我的电脑",
+			newName: "我的电脑", //nolint:gosmopolitan // intentional i18n test data
 			wantErr: "invalid characters",
 		},
 		{
@@ -911,7 +973,7 @@ func TestRenameNodeComprehensive(t *testing.T) {
 		},
 		{
 			name:    "mixed_chinese_emoji_rejected",
-			newName: "测试💻机器",
+			newName: "测试💻机器", //nolint:gosmopolitan // intentional i18n test data
 			wantErr: "invalid characters",
 		},
 		{
@@ -1000,6 +1062,7 @@ func TestListPeers(t *testing.T) {
 		if err != nil {
 			return err
 		}
+
 		_, err = RegisterNodeForTest(tx, node2, nil, nil)
 
 		return err
@@ -1085,6 +1148,7 @@ func TestListNodes(t *testing.T) {
 		if err != nil {
 			return err
 		}
+
 		_, err = RegisterNodeForTest(tx, node2, nil, nil)
 
 		return err
