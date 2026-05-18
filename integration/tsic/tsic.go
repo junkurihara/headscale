@@ -39,12 +39,22 @@ import (
 
 const (
 	tsicHashLength       = 6
-	defaultPingTimeout   = 200 * time.Millisecond
 	defaultPingCount     = 5
 	dockerContextPath    = "../."
 	caCertRoot           = "/usr/local/share/ca-certificates"
 	dockerExecuteTimeout = 60 * time.Second
 )
+
+// defaultPingTimeoutVal returns the per-attempt timeout for tailscale ping.
+// On CI, the docker exec overhead is higher so the timeout is doubled,
+// which also doubles the docker exec timeout (timeout * count).
+func defaultPingTimeoutVal() time.Duration {
+	if util.IsCI() {
+		return 400 * time.Millisecond
+	}
+
+	return 200 * time.Millisecond
+}
 
 var (
 	errTailscalePingFailed             = errors.New("ping failed")
@@ -797,6 +807,21 @@ func (t *TailscaleInContainer) Down() error {
 	return nil
 }
 
+// DisconnectFromNetwork detaches the container from network at the
+// docker daemon level. The container's network interface for that
+// network disappears and any in-flight TCP connection is left
+// half-open at the peer — the same failure mode a real cable pull
+// produces, which iptables-based simulations cannot reproduce.
+func (t *TailscaleInContainer) DisconnectFromNetwork(network *dockertest.Network) error {
+	return dockertestutil.DisconnectContainerFromNetwork(t.pool, network, t.hostname)
+}
+
+// ReconnectToNetwork is the inverse of DisconnectFromNetwork: it
+// re-attaches the container to network so traffic can flow again.
+func (t *TailscaleInContainer) ReconnectToNetwork(network *dockertest.Network) error {
+	return dockertestutil.ReconnectContainerToNetwork(t.pool, network, t.hostname)
+}
+
 // IPs returns the netip.Addr of the Tailscale instance.
 func (t *TailscaleInContainer) IPs() ([]netip.Addr, error) {
 	if len(t.ips) != 0 {
@@ -1348,7 +1373,7 @@ func WithPingUntilDirect(direct bool) PingOption {
 // TODO(kradalby): Make multiping, go routine magic.
 func (t *TailscaleInContainer) Ping(hostnameOrIP string, opts ...PingOption) error {
 	args := pingArgs{
-		timeout: defaultPingTimeout,
+		timeout: defaultPingTimeoutVal(),
 		count:   defaultPingCount,
 		direct:  true,
 	}
@@ -1393,7 +1418,14 @@ func (t *TailscaleInContainer) Ping(hostnameOrIP string, opts ...PingOption) err
 	}
 
 	if !args.direct {
-		if strings.Contains(result, "via DERP") {
+		// Non-direct mode accepts any indirect path: DERP, a plain
+		// tailscale relay, or a peer relay. Tailscale reports peer
+		// relay hops as "via peer-relay(ip:port:vni:N)", which does
+		// not contain the "via relay" substring and was previously
+		// rejected here.
+		if strings.Contains(result, "via DERP") ||
+			strings.Contains(result, "via relay") ||
+			strings.Contains(result, "via peer-relay") {
 			return nil
 		} else {
 			return errTailscalePingNotDERP
@@ -1613,6 +1645,11 @@ func (t *TailscaleInContainer) GetNodePrivateKey() (*key.NodePrivate, error) {
 	}
 
 	return &p.Persist.PrivateNodeKey, nil
+}
+
+// ConnectToNetwork connects the Tailscale container to an additional Docker network.
+func (t *TailscaleInContainer) ConnectToNetwork(network *dockertest.Network) error {
+	return t.container.ConnectToNetwork(network)
 }
 
 // PacketFilter returns the current packet filter rules from the client's network map.

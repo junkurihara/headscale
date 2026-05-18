@@ -24,7 +24,8 @@ distributions are Ubuntu 22.04 or newer, Debian 12 or newer.
     sudo apt install ./headscale.deb
     ```
 
-1. [Configure headscale by editing the configuration file](../../ref/configuration.md):
+1. [Configure headscale by editing the configuration file](../../ref/configuration.md). An up-to date example
+   configuration file is also available in `/usr/share/doc/headscale/examples/config-example.yaml`:
 
     ```shell
     sudo nano /etc/headscale/config.yaml
@@ -50,7 +51,7 @@ Continue on the [getting started page](../../usage/getting-started.md) to regist
 
     This installation method is considered advanced as one needs to take care of the local user and the systemd
     service themselves. If possible, use the [DEB packages](#using-packages-for-debianubuntu-recommended) or a
-    [community package](./community.md) instead.
+    [community package](community.md) instead.
 
 This section describes the installation of headscale according to the [Requirements and
 assumptions](../requirements.md#assumptions). Headscale is run by a dedicated local user and the service itself is

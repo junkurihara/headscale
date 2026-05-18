@@ -2,10 +2,12 @@ package mapper
 
 import (
 	"net/netip"
+	"slices"
 	"sort"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/policy"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
@@ -78,9 +80,14 @@ func (b *MapResponseBuilder) WithSelfNode() *MapResponseBuilder {
 	tailnode, err := nv.TailNode(
 		b.capVer,
 		func(id types.NodeID) []netip.Prefix {
-			return policy.ReduceRoutes(nv, b.mapper.state.GetNodePrimaryRoutes(id), matchers)
+			// Self node: include own primaries + exit routes (no via steering for self).
+			primaries := policy.ReduceRoutes(nv, b.mapper.state.GetNodePrimaryRoutes(id), matchers)
+
+			return slices.Concat(primaries, nv.ExitRoutes())
 		},
-		b.mapper.cfg)
+		b.mapper.cfg,
+		b.mapper.state.NodeCapMap(nv.ID()),
+	)
 	if err != nil {
 		b.addError(err)
 		return b
@@ -154,7 +161,7 @@ func (b *MapResponseBuilder) WithDNSConfig() *MapResponseBuilder {
 		return b
 	}
 
-	b.resp.DNSConfig = generateDNSConfig(b.mapper.cfg, node)
+	b.resp.DNSConfig = generateDNSConfig(b.mapper.cfg, node, b.mapper.state.NodeCapMap(node.ID()))
 
 	return b
 }
@@ -251,14 +258,38 @@ func (b *MapResponseBuilder) buildTailPeers(peers views.Slice[types.NodeView]) (
 		changedViews = peers
 	}
 
-	tailPeers, err := types.TailNodes(
-		changedViews, b.capVer,
-		func(id types.NodeID) []netip.Prefix {
-			return policy.ReduceRoutes(node, b.mapper.state.GetNodePrimaryRoutes(id), matchers)
-		},
-		b.mapper.cfg)
-	if err != nil {
-		return nil, err
+	// Snapshot the per-node policy CapMap once per peer-list build
+	// instead of locking the policy manager per peer. The per-call
+	// path used to take pm.mu N times for an N-peer response.
+	allCapMaps := b.mapper.state.NodeCapMaps()
+
+	// Build tail nodes with per-peer via-aware route function.
+	tailPeers := make([]*tailcfg.Node, 0, changedViews.Len())
+
+	for _, peer := range changedViews.All() {
+		// Pass the peer's policy CapMap as selfPolicyCaps so per-peer
+		// address-shape rules (today: disable-ipv4) apply consistently
+		// in the viewer's netmap. The CapMap merge into tn.CapMap is
+		// overwritten by the PeerCapMap call below; only the address
+		// filtering side-effect inside TailNode survives.
+		tn, err := peer.TailNode(b.capVer, func(_ types.NodeID) []netip.Prefix {
+			return b.mapper.state.RoutesForPeer(node, peer, matchers)
+		}, b.mapper.cfg, allCapMaps[peer.ID()])
+		if err != nil {
+			return nil, err
+		}
+
+		// [tailcfg.Node.CapMap] on a peer carries the small set of
+		// caps the Tailscale client reads from the peer view rather
+		// than the self view (suggest-exit-node, dns-subdomain-resolve
+		// — see ipn/ipnlocal/local.go:7534 and node_backend.go:745).
+		// The Tailscale-hosted control plane stamps these only when
+		// the peer satisfies the cap's emission condition; every other
+		// cap stays off the peer view, leaving CapMap empty for most
+		// peers. [policyv2.PeerCapMap] encodes those conditions.
+		tn.CapMap = policyv2.PeerCapMap(peer, allCapMaps[peer.ID()])
+
+		tailPeers = append(tailPeers, tn)
 	}
 
 	// Peers is always returned sorted by Node.ID.
@@ -267,6 +298,12 @@ func (b *MapResponseBuilder) buildTailPeers(peers views.Slice[types.NodeView]) (
 	})
 
 	return tailPeers, nil
+}
+
+// WithPingRequest adds a PingRequest to the response.
+func (b *MapResponseBuilder) WithPingRequest(pr *tailcfg.PingRequest) *MapResponseBuilder {
+	b.resp.PingRequest = pr
+	return b
 }
 
 // WithPeerChangedPatch adds peer change patches.

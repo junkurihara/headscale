@@ -24,6 +24,9 @@ import (
 // ErrCannotParseBoolean is returned when a value cannot be parsed as boolean.
 var ErrCannotParseBoolean = errors.New("cannot parse value as boolean")
 
+// ErrCannotParseStringSlice is returned when a value cannot be parsed as string or []string.
+var ErrCannotParseStringSlice = errors.New("cannot parse value as string or []string")
+
 type UserID uint64
 
 type Users []User
@@ -229,6 +232,29 @@ func (u UserView) MarshalZerologObject(e *zerolog.Event) {
 	u.ж.MarshalZerologObject(e)
 }
 
+// FlexibleStringSlice handles OIDC providers (e.g. JumpCloud) that return the
+// groups claim as a plain string when the user belongs to a single group,
+// instead of a single-element array.
+type FlexibleStringSlice []string
+
+func (f *FlexibleStringSlice) UnmarshalJSON(data []byte) error {
+	var arr []string
+	err := json.Unmarshal(data, &arr)
+	if err == nil {
+		*f = arr
+		return nil
+	}
+
+	var single string
+	err = json.Unmarshal(data, &single)
+	if err == nil {
+		*f = []string{single}
+		return nil
+	}
+
+	return fmt.Errorf("%w: %s", ErrCannotParseStringSlice, string(data))
+}
+
 // FlexibleBoolean handles JumpCloud's JSON where email_verified is returned as a
 // string "true" or "false" instead of a boolean.
 // This maps bool to a specific type with a custom unmarshaler to
@@ -269,9 +295,9 @@ type OIDCClaims struct {
 
 	// Name is the user's full name.
 	Name              string          `json:"name,omitempty"`
-	Groups            []string        `json:"groups,omitempty"`
-	Email             string          `json:"email,omitempty"`
-	EmailVerified     FlexibleBoolean `json:"email_verified,omitempty"`
+	Groups            FlexibleStringSlice `json:"groups,omitempty"`
+	Email             string              `json:"email,omitempty"`
+	EmailVerified     FlexibleBoolean     `json:"email_verified,omitempty"`
 	ProfilePictureURL string          `json:"picture,omitempty"`
 	Username          string          `json:"preferred_username,omitempty"`
 }
@@ -304,21 +330,14 @@ func (c *OIDCClaims) Identifier() string {
 	subject := c.Sub
 
 	var result string
-	// Try to parse as URL to handle URL joining correctly
-	if u, err := url.Parse(issuer); err == nil && u.Scheme != "" { //nolint:noinlineerr
-		// For URLs, use proper URL path joining
-		if joined, err := url.JoinPath(issuer, subject); err == nil { //nolint:noinlineerr
-			result = joined
-		}
-	}
-
-	// If URL joining failed or issuer wasn't a URL, do simple string join
-	if result == "" {
-		// Default case: simple string joining with slash
-		issuer = strings.TrimSuffix(issuer, "/")
-		subject = strings.TrimPrefix(subject, "/")
-		result = issuer + "/" + subject
-	}
+	// Always use simple string concatenation with a slash separator.
+	// url.JoinPath resolves path-traversal segments like ".." and ".",
+	// which can silently drop the subject and cause identifier collisions
+	// between distinct OIDC users (e.g., Sub=".." produces the same
+	// identifier as an empty Sub).
+	issuer = strings.TrimSuffix(issuer, "/")
+	subject = strings.TrimPrefix(subject, "/")
+	result = issuer + "/" + subject
 
 	// Clean the result and return it
 	return CleanIdentifier(result)
@@ -394,9 +413,9 @@ type OIDCUserInfo struct {
 	FamilyName        string          `json:"family_name"`
 	PreferredUsername string          `json:"preferred_username"`
 	Email             string          `json:"email"`
-	EmailVerified     FlexibleBoolean `json:"email_verified,omitempty"`
-	Groups            []string        `json:"groups"`
-	Picture           string          `json:"picture"`
+	EmailVerified     FlexibleBoolean     `json:"email_verified,omitempty"`
+	Groups            FlexibleStringSlice `json:"groups"`
+	Picture           string              `json:"picture"`
 }
 
 // FromClaim overrides a User from OIDC claims.

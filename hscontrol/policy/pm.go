@@ -36,6 +36,34 @@ type PolicyManager interface {
 	// NodeCanApproveRoute reports whether the given node can approve the given route.
 	NodeCanApproveRoute(node types.NodeView, route netip.Prefix) bool
 
+	// ViaRoutesForPeer computes via grant effects for a viewer-peer pair.
+	// It returns which routes should be included (peer is via-designated for viewer)
+	// and excluded (steered to a different peer). When no via grants apply,
+	// both fields are empty and the caller falls back to existing behavior.
+	ViaRoutesForPeer(viewer, peer types.NodeView) types.ViaRouteResult
+
+	// NodeCapMap returns the policy-derived CapMap for the given node,
+	// or nil when no nodeAttrs entry targets it. The returned map is
+	// owned by the manager; treat it as read-only and copy before
+	// merging into a [tailcfg.Node]. It describes the node's own
+	// capabilities, not a per-viewer view.
+	NodeCapMap(id types.NodeID) tailcfg.NodeCapMap
+
+	// NodeCapMaps returns a snapshot of the per-node policy CapMap so
+	// callers can amortise lock acquisitions over a peer loop. The
+	// outer map is a fresh container; the inner [tailcfg.NodeCapMap]
+	// values are shared with the manager and read-only.
+	NodeCapMaps() map[types.NodeID]tailcfg.NodeCapMap
+
+	// NodesWithChangedCapMap returns the IDs of nodes whose nodeAttrs
+	// CapMap shifted during recent updateLocked calls. The buffer
+	// drains on read; callers consume it once per update cycle to
+	// decide which nodes need a self-targeted MapResponse.
+	// refreshNodeAttrsLocked appends to the buffer rather than
+	// overwriting, so a SetUsers/SetNodes between SetPolicy and the
+	// drain cannot lose the policy-reload diff.
+	NodesWithChangedCapMap() []types.NodeID
+
 	Version() int
 	DebugString() string
 }

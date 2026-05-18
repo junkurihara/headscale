@@ -276,6 +276,31 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 		extraRecordsUpdate = make(chan []tailcfg.DNSRecord)
 	}
 
+	var (
+		haProber     *state.HAHealthProber
+		haHealthChan <-chan time.Time
+	)
+	if h.cfg.Node.Routes.HA.ProbeInterval > 0 {
+		haProber = state.NewHAHealthProber(
+			h.state,
+			h.cfg.Node.Routes.HA,
+			h.cfg.ServerURL,
+			h.mapBatcher.IsConnected,
+		)
+
+		haTicker := time.NewTicker(h.cfg.Node.Routes.HA.ProbeInterval)
+		defer haTicker.Stop()
+
+		haHealthChan = haTicker.C
+
+		log.Info().
+			Dur("interval", h.cfg.Node.Routes.HA.ProbeInterval).
+			Dur("timeout", h.cfg.Node.Routes.HA.ProbeTimeout).
+			Msg("HA subnet router health probing enabled")
+	} else {
+		haHealthChan = make(<-chan time.Time)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -332,6 +357,9 @@ func (h *Headscale) scheduledTasks(ctx context.Context) {
 			h.cfg.TailcfgDNSConfig.ExtraRecords = records
 
 			h.Change(change.ExtraRecords())
+
+		case <-haHealthChan:
+			haProber.ProbeOnce(ctx, h.Change)
 		}
 	}
 }
@@ -460,6 +488,20 @@ func (h *Headscale) ensureUnixSocketIsAbsent() error {
 	return os.Remove(h.cfg.UnixSocket)
 }
 
+// securityHeaders sets baseline response headers on every HTTP response:
+// deny framing (clickjacking), forbid MIME-type sniffing, drop the Referer
+// header on outbound navigation. Cheap defense-in-depth for HTML surfaces.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", "frame-ancestors 'none'")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(metrics.Collector(metrics.CollectorOpts{
@@ -473,6 +515,7 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 	r.Use(middleware.RealIP)
 	r.Use(middleware.RequestLogger(&zerologRequestLogger{}))
 	r.Use(middleware.Recoverer)
+	r.Use(securityHeaders)
 
 	r.Post(ts2021UpgradePath, h.NoiseUpgradeHandler)
 
@@ -485,6 +528,7 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 
 	if provider, ok := h.authProvider.(*AuthProviderOIDC); ok {
 		r.Get("/oidc/callback", provider.OIDCCallbackHandler)
+		r.Post("/register/confirm/{auth_id}", provider.RegisterConfirmHandler)
 	}
 
 	r.Get("/apple", h.AppleConfigMessage)
@@ -508,6 +552,10 @@ func (h *Headscale) createRouter(grpcMux *grpcRuntime.ServeMux) *chi.Mux {
 		r.Use(h.httpAuthenticationMiddleware)
 		r.HandleFunc("/v1/*", grpcMux.ServeHTTP)
 	})
+	// Ping response endpoint: receives HEAD from clients responding
+	// to a PingRequest. The unguessable ping ID serves as authentication.
+	r.Head("/machine/ping-response", h.PingResponseHandler)
+
 	r.Get("/favicon.ico", FaviconHandler)
 	r.Get("/", BlankHandler)
 
@@ -583,7 +631,7 @@ func (h *Headscale) Serve() error {
 
 	ephmNodes := h.state.ListEphemeralNodes()
 	for _, node := range ephmNodes.All() {
-		h.ephemeralGC.Schedule(node.ID(), h.cfg.EphemeralNodeInactivityTimeout)
+		h.ephemeralGC.Schedule(node.ID(), h.cfg.Node.Ephemeral.InactivityTimeout)
 	}
 
 	if h.cfg.DNSConfig.ExtraRecordsPath != "" {
@@ -727,7 +775,6 @@ func (h *Headscale) Serve() error {
 		grpcServer = grpc.NewServer(grpcOptions...)
 
 		v1.RegisterHeadscaleServiceServer(grpcServer, newHeadscaleV1APIServer(h))
-		reflection.Register(grpcServer)
 
 		grpcListener, err = new(net.ListenConfig).Listen(context.Background(), "tcp", h.cfg.GRPCAddr)
 		if err != nil {
@@ -1107,6 +1154,11 @@ func (h *Headscale) StartBatcherForTest(tb testing.TB) {
 	h.mapBatcher = mapper.NewBatcherAndMapper(h.cfg, h.state)
 	h.mapBatcher.Start()
 	tb.Cleanup(func() { h.mapBatcher.Close() })
+}
+
+// MapBatcher returns the map response batcher (for test use).
+func (h *Headscale) MapBatcher() *mapper.Batcher {
+	return h.mapBatcher
 }
 
 // StartEphemeralGCForTest starts the ephemeral node garbage collector.

@@ -1,6 +1,7 @@
 package hscontrol
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,28 @@ var ErrUnsupportedURLParameterType = errors.New("unsupported URL parameter type"
 
 // ErrNoAuthSession is returned when an auth_id does not match any active auth session.
 var ErrNoAuthSession = errors.New("no auth session found")
+
+// ErrSSHDstNodeNotFound is returned when the dst node id on a Noise SSH
+// action request does not match any registered node.
+var ErrSSHDstNodeNotFound = errors.New("ssh action: unknown dst node id")
+
+// ErrSSHMachineKeyMismatch is returned when the Noise session's machine
+// key does not match the dst node referenced in the SSH action URL.
+var ErrSSHMachineKeyMismatch = errors.New(
+	"ssh action: noise session machine key does not match dst node",
+)
+
+// ErrSSHAuthSessionNotBound is returned when an SSH action follow-up
+// references an auth session that is not bound to an SSH check pair.
+var ErrSSHAuthSessionNotBound = errors.New(
+	"ssh action: cached auth session is not an SSH-check binding",
+)
+
+// ErrSSHBindingMismatch is returned when an SSH action follow-up's
+// (src, dst) pair does not match the cached binding for its auth_id.
+var ErrSSHBindingMismatch = errors.New(
+	"ssh action: cached binding does not match request src/dst",
+)
 
 const (
 	// ts2021UpgradePath is the path that the server listens on for the WebSockets upgrade.
@@ -146,7 +169,7 @@ func (h *Headscale) NoiseUpgradeHandler(
 		r.Post("/map", ns.PollNetMapHandler)
 
 		// SSH Check mode endpoint, consulted to validate if a given SSH connection should be accepted or rejected.
-		r.Get("/ssh/action/from/{src_node_id}/to/{dst_node_id}", ns.SSHActionHandler)
+		r.Get("/ssh/action/{src_node_id}/to/{dst_node_id}", ns.SSHActionHandler)
 
 		// Not implemented yet
 		//
@@ -272,6 +295,31 @@ func (ns *noiseServer) NotImplementedHandler(writer http.ResponseWriter, req *ht
 	http.Error(writer, "Not implemented yet", http.StatusNotImplemented)
 }
 
+// PingResponseHandler handles HEAD requests from clients responding to a
+// PingRequest. The client calls this endpoint to prove connectivity.
+// The unguessable ping ID serves as authentication.
+func (h *Headscale) PingResponseHandler(
+	writer http.ResponseWriter,
+	req *http.Request,
+) {
+	if req.Method != http.MethodHead {
+		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	pingID := req.URL.Query().Get("id")
+	if pingID == "" {
+		http.Error(writer, "missing ping ID", http.StatusBadRequest)
+		return
+	}
+
+	if h.state.CompletePing(pingID) {
+		writer.WriteHeader(http.StatusOK)
+	} else {
+		http.Error(writer, "unknown or expired ping", http.StatusNotFound)
+	}
+}
+
 func urlParam[T any](req *http.Request, key string) (T, error) {
 	var zero T
 
@@ -337,16 +385,47 @@ func (ns *noiseServer) SSHActionHandler(
 		return
 	}
 
+	// Authenticate the Noise session: the destination node is the
+	// tailscaled instance asking us whether to permit an incoming SSH
+	// connection, so its Noise session must belong to dst. Without this
+	// check any unauthenticated client could open a Noise tunnel with a
+	// throwaway machine key and pollute lastSSHAuth for arbitrary
+	// (src, dst) pairs, defeating SSH check-mode's stolen-key
+	// protections.
+	dstNode, ok := ns.headscale.state.GetNodeByID(dstNodeID)
+	if !ok {
+		httpError(writer, NewHTTPError(
+			http.StatusNotFound,
+			"dst node not found",
+			fmt.Errorf("%w: %d", ErrSSHDstNodeNotFound, dstNodeID),
+		))
+
+		return
+	}
+
+	if dstNode.MachineKey() != ns.machineKey {
+		httpError(writer, NewHTTPError(
+			http.StatusUnauthorized,
+			"machine key does not match dst node",
+			fmt.Errorf(
+				"%w: machine key %s, dst node %d",
+				ErrSSHMachineKeyMismatch, ns.machineKey.ShortString(), dstNodeID,
+			),
+		))
+
+		return
+	}
+
 	reqLog := log.With().
 		Uint64("src_node_id", srcNodeID.Uint64()).
 		Uint64("dst_node_id", dstNodeID.Uint64()).
-		Str("ssh_user", req.URL.Query().Get("ssh_user")).
 		Str("local_user", req.URL.Query().Get("local_user")).
 		Logger()
 
 	reqLog.Trace().Caller().Msg("SSH action request")
 
 	action, err := ns.sshAction(
+		req.Context(),
 		reqLog,
 		srcNodeID, dstNodeID,
 		req.URL.Query().Get("auth_id"),
@@ -384,6 +463,7 @@ func (ns *noiseServer) SSHActionHandler(
 //  3. Follow-up request — an auth_id is present, wait for the auth
 //     verdict and accept or reject.
 func (ns *noiseServer) sshAction(
+	ctx context.Context,
 	reqLog zerolog.Logger,
 	srcNodeID, dstNodeID types.NodeID,
 	authIDStr string,
@@ -403,7 +483,7 @@ func (ns *noiseServer) sshAction(
 	// Follow-up request with auth_id — wait for the auth verdict.
 	if authIDStr != "" {
 		return ns.sshActionFollowUp(
-			reqLog, &action, authIDStr,
+			ctx, reqLog, &action, authIDStr,
 			srcNodeID, dstNodeID,
 			checkFound,
 		)
@@ -426,19 +506,21 @@ func (ns *noiseServer) sshAction(
 	}
 
 	// No auto-approval — create an auth session and hold.
-	return ns.sshActionHoldAndDelegate(reqLog, &action)
+	return ns.sshActionHoldAndDelegate(reqLog, &action, srcNodeID, dstNodeID)
 }
 
-// sshActionHoldAndDelegate creates a new auth session and returns a
-// HoldAndDelegate action that directs the client to authenticate.
+// sshActionHoldAndDelegate creates a new auth session bound to the
+// (src, dst) pair and returns a HoldAndDelegate action that directs the
+// client to authenticate.
 func (ns *noiseServer) sshActionHoldAndDelegate(
 	reqLog zerolog.Logger,
 	action *tailcfg.SSHAction,
+	srcNodeID, dstNodeID types.NodeID,
 ) (*tailcfg.SSHAction, error) {
 	holdURL, err := url.Parse(
 		ns.headscale.cfg.ServerURL +
-			"/machine/ssh/action/from/$SRC_NODE_ID/to/$DST_NODE_ID" +
-			"?ssh_user=$SSH_USER&local_user=$LOCAL_USER",
+			"/machine/ssh/action/$SRC_NODE_ID/to/$DST_NODE_ID" +
+			"?local_user=$LOCAL_USER",
 	)
 	if err != nil {
 		return nil, NewHTTPError(
@@ -457,7 +539,10 @@ func (ns *noiseServer) sshActionHoldAndDelegate(
 		)
 	}
 
-	ns.headscale.state.SetAuthCacheEntry(authID, types.NewAuthRequest())
+	ns.headscale.state.SetAuthCacheEntry(
+		authID,
+		types.NewSSHCheckAuthRequest(srcNodeID, dstNodeID),
+	)
 
 	authURL := ns.headscale.authProvider.AuthURL(authID)
 
@@ -484,8 +569,10 @@ func (ns *noiseServer) sshActionHoldAndDelegate(
 }
 
 // sshActionFollowUp handles follow-up requests where the client
-// provides an auth_id. It blocks until the auth session resolves.
+// provides an auth_id. It blocks until the auth session resolves or
+// the request context is cancelled (e.g. the client disconnects).
 func (ns *noiseServer) sshActionFollowUp(
+	ctx context.Context,
 	reqLog zerolog.Logger,
 	action *tailcfg.SSHAction,
 	authIDStr string,
@@ -512,9 +599,49 @@ func (ns *noiseServer) sshActionFollowUp(
 		)
 	}
 
+	// Verify the cached binding matches the (src, dst) pair the
+	// follow-up URL claims. Without this check an attacker who knew an
+	// auth_id could submit a follow-up for any other (src, dst) pair
+	// and have its verdict recorded against that pair instead.
+	if !auth.IsSSHCheck() {
+		return nil, NewHTTPError(
+			http.StatusBadRequest,
+			"auth session is not for SSH check",
+			fmt.Errorf("%w: %s", ErrSSHAuthSessionNotBound, authID),
+		)
+	}
+
+	binding := auth.SSHCheckBinding()
+	if binding.SrcNodeID != srcNodeID || binding.DstNodeID != dstNodeID {
+		return nil, NewHTTPError(
+			http.StatusUnauthorized,
+			"src/dst pair does not match auth session",
+			fmt.Errorf(
+				"%w: cached %d->%d, request %d->%d",
+				ErrSSHBindingMismatch,
+				binding.SrcNodeID, binding.DstNodeID,
+				srcNodeID, dstNodeID,
+			),
+		)
+	}
+
 	reqLog.Trace().Caller().Msg("SSH action follow-up")
 
-	verdict := <-auth.WaitForAuth()
+	var verdict types.AuthVerdict
+	select {
+	case <-ctx.Done():
+		// The client disconnected (or its request timed out) before the
+		// auth session resolved. Return an error so the parked goroutine
+		// is freed; without this select sshActionFollowUp would block
+		// until the cache eviction callback signalled FinishAuth, which
+		// could be up to register_cache_expiration (15 minutes).
+		return nil, NewHTTPError(
+			http.StatusUnauthorized,
+			"ssh action follow-up cancelled",
+			ctx.Err(),
+		)
+	case verdict = <-auth.WaitForAuth():
+	}
 
 	if !verdict.Accept() {
 		action.Reject = true

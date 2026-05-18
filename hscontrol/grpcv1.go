@@ -26,6 +26,7 @@ import (
 	"tailscale.com/types/views"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/state"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -781,6 +782,35 @@ func (api headscaleV1APIServer) SetPolicy(
 	return response, nil
 }
 
+// CheckPolicy validates the given policy against the server's live users
+// and nodes, running its `tests` block as a sandbox. Nothing is persisted
+// and the live PolicyManager is not touched. Works regardless of
+// policy.mode so operators can validate a policy file before storing it.
+func (api headscaleV1APIServer) CheckPolicy(
+	_ context.Context,
+	request *v1.CheckPolicyRequest,
+) (*v1.CheckPolicyResponse, error) {
+	polB := []byte(request.GetPolicy())
+
+	users, err := api.h.state.ListAllUsers()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "loading users: %s", err)
+	}
+
+	nodes := api.h.state.ListNodes()
+
+	pm, err := policyv2.NewPolicyManager(polB, users, nodes)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	if _, err := pm.SetPolicy(polB); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	return &v1.CheckPolicyResponse{}, nil
+}
+
 // The following service calls are for testing and debugging
 func (api headscaleV1APIServer) DebugCreateNode(
 	ctx context.Context,
@@ -802,27 +832,16 @@ func (api headscaleV1APIServer) DebugCreateNode(
 		Interface("route-str", request.GetRoutes()).
 		Msg("Creating routes for node")
 
-	hostinfo := tailcfg.Hostinfo{
-		RoutableIPs: routes,
-		OS:          "TestOS",
-		Hostname:    request.GetName(),
-	}
-
 	registrationId, err := types.AuthIDFromString(request.GetKey())
 	if err != nil {
 		return nil, err
 	}
 
-	newNode := types.Node{
+	regData := &types.RegistrationData{
 		NodeKey:    key.NewNode().Public(),
 		MachineKey: key.NewMachine().Public(),
 		Hostname:   request.GetName(),
-		User:       user,
-
-		Expiry:   &time.Time{},
-		LastSeen: &time.Time{},
-
-		Hostinfo: &hostinfo,
+		Expiry:     &time.Time{}, // zero time, not nil — preserves proto JSON round-trip semantics
 	}
 
 	log.Debug().
@@ -830,10 +849,27 @@ func (api headscaleV1APIServer) DebugCreateNode(
 		Str("registration_id", registrationId.String()).
 		Msg("adding debug machine via CLI, appending to registration cache")
 
-	authRegReq := types.NewRegisterAuthRequest(newNode)
+	authRegReq := types.NewRegisterAuthRequest(regData)
 	api.h.state.SetAuthCacheEntry(registrationId, authRegReq)
 
-	return &v1.DebugCreateNodeResponse{Node: newNode.Proto()}, nil
+	// Echo back a synthetic Node so the debug response surface stays
+	// stable. The actual node is created later by AuthApprove via
+	// HandleNodeFromAuthPath using the cached RegistrationData.
+	echoNode := types.Node{
+		NodeKey:    regData.NodeKey,
+		MachineKey: regData.MachineKey,
+		Hostname:   regData.Hostname,
+		User:       user,
+		Expiry:     &time.Time{},
+		LastSeen:   &time.Time{},
+		Hostinfo: &tailcfg.Hostinfo{
+			Hostname:    request.GetName(),
+			OS:          "TestOS",
+			RoutableIPs: routes,
+		},
+	}
+
+	return &v1.DebugCreateNodeResponse{Node: echoNode.Proto()}, nil
 }
 
 func (api headscaleV1APIServer) Health(

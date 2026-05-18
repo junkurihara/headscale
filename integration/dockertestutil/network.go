@@ -1,11 +1,14 @@
 package dockertestutil
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net"
+	"time"
 
+	"github.com/cenkalti/backoff/v5"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
@@ -13,14 +16,48 @@ import (
 
 var ErrContainerNotFound = errors.New("container not found")
 
+// retryDockerOp absorbs eventual-consistency races in libnetwork endpoint cleanup.
+func retryDockerOp(ctx context.Context, op func() error) error {
+	_, err := backoff.Retry(ctx, func() (struct{}, error) {
+		err := op()
+		if err != nil {
+			return struct{}{}, err
+		}
+
+		return struct{}{}, nil
+	}, backoff.WithBackOff(backoff.NewExponentialBackOff()), backoff.WithMaxElapsedTime(30*time.Second))
+
+	return err
+}
+
 func GetFirstOrCreateNetwork(pool *dockertest.Pool, name string) (*dockertest.Network, error) {
+	return GetFirstOrCreateNetworkWithSubnet(pool, name, "")
+}
+
+// GetFirstOrCreateNetworkWithSubnet creates a Docker network with an optional
+// custom subnet. When subnet is empty, Docker auto-assigns from its default
+// pool. Use RFC 5737 TEST-NET ranges (e.g. "198.51.100.0/24") for networks
+// that need to be reachable through Tailscale exit nodes, since Tailscale's
+// shrinkDefaultRoute strips RFC1918 ranges from exit node forwarding filters.
+func GetFirstOrCreateNetworkWithSubnet(pool *dockertest.Pool, name, subnet string) (*dockertest.Network, error) {
 	networks, err := pool.NetworksByName(name)
 	if err != nil {
 		return nil, fmt.Errorf("looking up network names: %w", err)
 	}
 
 	if len(networks) == 0 {
-		if _, err := pool.CreateNetwork(name); err == nil { //nolint:noinlineerr // intentional inline check
+		var opts []func(*docker.CreateNetworkOptions)
+		if subnet != "" {
+			opts = append(opts, func(config *docker.CreateNetworkOptions) {
+				config.IPAM = &docker.IPAMOptions{
+					Config: []docker.IPAMConfig{
+						{Subnet: subnet},
+					},
+				}
+			})
+		}
+
+		if _, err := pool.CreateNetwork(name, opts...); err == nil { //nolint:noinlineerr // intentional inline check
 			// Create does not give us an updated version of the resource, so we need to
 			// get it again.
 			networks, err := pool.NetworksByName(name)
@@ -52,13 +89,6 @@ func AddContainerToNetwork(
 		return err
 	}
 
-	err = pool.Client.ConnectNetwork(network.Network.ID, docker.NetworkConnectionOptions{
-		Container: containers[0].ID,
-	})
-	if err != nil {
-		return err
-	}
-
 	// TODO(kradalby): This doesn't work reliably, but calling the exact same functions
 	// seem to work fine...
 	// if container, ok := pool.ContainerByName("/" + testContainer); ok {
@@ -68,7 +98,53 @@ func AddContainerToNetwork(
 	// 	}
 	// }
 
-	return nil
+	return retryDockerOp(context.Background(), func() error {
+		return pool.Client.ConnectNetwork(network.Network.ID, docker.NetworkConnectionOptions{
+			Container: containers[0].ID,
+		})
+	})
+}
+
+// DisconnectContainerFromNetwork removes the container from network at
+// the docker daemon level. Mirrors a physical cable pull: the
+// container's network interface for that network disappears and any
+// in-flight TCP connections are left half-open, exactly the failure
+// mode iptables-based simulations cannot reproduce.
+func DisconnectContainerFromNetwork(
+	pool *dockertest.Pool,
+	network *dockertest.Network,
+	testContainer string,
+) error {
+	containers, err := pool.Client.ListContainers(docker.ListContainersOptions{
+		All: true,
+		Filters: map[string][]string{
+			"name": {testContainer},
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	if len(containers) == 0 {
+		return fmt.Errorf("%w: %s", ErrContainerNotFound, testContainer)
+	}
+
+	return retryDockerOp(context.Background(), func() error {
+		return pool.Client.DisconnectNetwork(network.Network.ID, docker.NetworkConnectionOptions{
+			Container: containers[0].ID,
+		})
+	})
+}
+
+// ReconnectContainerToNetwork is the inverse of
+// DisconnectContainerFromNetwork — re-attaches the container to the
+// network so traffic can flow again.
+func ReconnectContainerToNetwork(
+	pool *dockertest.Pool,
+	network *dockertest.Network,
+	testContainer string,
+) error {
+	return AddContainerToNetwork(pool, network, testContainer)
 }
 
 // RandomFreeHostPort asks the kernel for a free open port that is ready to use.
