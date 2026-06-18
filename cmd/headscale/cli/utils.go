@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"time"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
@@ -15,6 +16,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/prometheus/common/model"
+	"github.com/pterm/pterm"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
@@ -85,6 +87,23 @@ func grpcRunE(
 	}
 }
 
+// withGRPC opens a gRPC client, runs fn with it, and tears the
+// connection down afterwards. It is the building block for commands
+// that branch on a flag before deciding to talk to the server, where
+// grpcRunE's whole-RunE wrapping does not fit.
+func withGRPC(
+	fn func(ctx context.Context, client v1.HeadscaleServiceClient) error,
+) error {
+	ctx, client, conn, cancel, err := newHeadscaleCLIWithConfig()
+	if err != nil {
+		return fmt.Errorf("connecting to headscale: %w", err)
+	}
+	defer cancel()
+	defer conn.Close()
+
+	return fn(ctx, client)
+}
+
 func newHeadscaleCLIWithConfig() (context.Context, v1.HeadscaleServiceClient, *grpc.ClientConn, context.CancelFunc, error) {
 	cfg, err := types.LoadCLIConfig()
 	if err != nil {
@@ -144,7 +163,8 @@ func newHeadscaleCLIWithConfig() (context.Context, v1.HeadscaleServiceClient, *g
 			return nil, nil, nil, nil, errAPIKeyNotSet
 		}
 
-		grpcOptions = append(grpcOptions,
+		grpcOptions = append(
+			grpcOptions,
 			grpc.WithPerRPCCredentials(tokenAuth{
 				token: apiKey,
 			}),
@@ -158,11 +178,13 @@ func newHeadscaleCLIWithConfig() (context.Context, v1.HeadscaleServiceClient, *g
 				InsecureSkipVerify: true,
 			}
 
-			grpcOptions = append(grpcOptions,
+			grpcOptions = append(
+				grpcOptions,
 				grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
 			)
 		} else {
-			grpcOptions = append(grpcOptions,
+			grpcOptions = append(
+				grpcOptions,
 				grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")),
 			)
 		}
@@ -251,9 +273,19 @@ func confirmAction(cmd *cobra.Command, prompt string) bool {
 	return util.YesNo(prompt)
 }
 
+// renderTable prints a human-readable pterm table with the given header row
+// and data rows, using the shared header styling.
+func renderTable(header []string, rows [][]string) error {
+	tableData := make(pterm.TableData, 0, 1+len(rows))
+	tableData = append(tableData, header)
+	tableData = append(tableData, rows...)
+
+	return pterm.DefaultTable.WithHasHeader().WithData(tableData).Render()
+}
+
 // printListOutput checks the --output flag: when a machine-readable format is
-// requested it serialises data as JSON/YAML; otherwise it calls renderTable
-// to produce the human-readable pterm table.
+// requested it serialises data as JSON/YAML; otherwise it calls the render
+// callback to produce the human-readable pterm table.
 func printListOutput(
 	cmd *cobra.Command,
 	data any,
@@ -275,34 +307,21 @@ func printError(err error, outputFormat string) {
 		Error string `json:"error"`
 	}
 
-	e := errOutput{Error: err.Error()}
-
-	var formatted []byte
-
-	switch outputFormat {
-	case outputFormatJSON:
-		formatted, _ = json.MarshalIndent(e, "", "\t") //nolint:errchkjson // errOutput contains only a string field
-	case outputFormatJSONLine:
-		formatted, _ = json.Marshal(e) //nolint:errchkjson // errOutput contains only a string field
-	case outputFormatYAML:
-		formatted, _ = yaml.Marshal(e)
-	default:
+	if outputFormat == "" {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
 
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "%s\n", formatted)
+	// formatOutput cannot fail here: errOutput is a single string field.
+	out, _ := formatOutput(errOutput{Error: err.Error()}, "", outputFormat)
+	fmt.Fprintf(os.Stderr, "%s\n", out)
 }
 
 func hasMachineOutputFlag() bool {
-	for _, arg := range os.Args {
-		if arg == outputFormatJSON || arg == outputFormatJSONLine || arg == outputFormatYAML {
-			return true
-		}
-	}
-
-	return false
+	return slices.ContainsFunc(os.Args, func(arg string) bool {
+		return arg == outputFormatJSON || arg == outputFormatJSONLine || arg == outputFormatYAML
+	})
 }
 
 type tokenAuth struct {

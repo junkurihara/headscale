@@ -208,10 +208,7 @@ func (s *State) lockRegistration(machineKey key.MachinePublic) func() {
 // NewState creates and initializes a new [State] instance, setting up the database,
 // IP allocator, DERP map, policy manager, and loading existing users and nodes.
 func NewState(cfg *types.Config) (*State, error) {
-	cacheExpiration := registerCacheExpiration
-	if cfg.Tuning.RegisterCacheExpiration != 0 {
-		cacheExpiration = cfg.Tuning.RegisterCacheExpiration
-	}
+	cacheExpiration := cmp.Or(cfg.Tuning.RegisterCacheExpiration, registerCacheExpiration)
 
 	cacheMaxEntries := defaultRegisterCacheMaxEntries
 	if cfg.Tuning.RegisterCacheMaxEntries > 0 {
@@ -247,7 +244,7 @@ func NewState(cfg *types.Config) (*State, error) {
 		node.IsOnline = new(false)
 	}
 
-	users, err := db.ListUsers()
+	users, err := db.ListUsers(nil)
 	if err != nil {
 		return nil, fmt.Errorf("loading users: %w", err)
 	}
@@ -264,15 +261,9 @@ func NewState(cfg *types.Config) (*State, error) {
 
 	// Apply defaults for [NodeStore] batch configuration if not set.
 	// This ensures tests that create Config directly (without viper) still work.
-	batchSize := cfg.Tuning.NodeStoreBatchSize
-	if batchSize == 0 {
-		batchSize = defaultNodeStoreBatchSize
-	}
+	batchSize := cmp.Or(cfg.Tuning.NodeStoreBatchSize, defaultNodeStoreBatchSize)
 
-	batchTimeout := cfg.Tuning.NodeStoreBatchTimeout
-	if batchTimeout == 0 {
-		batchTimeout = defaultNodeStoreBatchTimeout
-	}
+	batchTimeout := cmp.Or(cfg.Tuning.NodeStoreBatchTimeout, defaultNodeStoreBatchTimeout)
 
 	// [policy.PolicyManager.BuildPeerMap] handles both global and per-node filter complexity.
 	// This moves the complex peer relationship logic into the policy package where it belongs.
@@ -508,7 +499,7 @@ func (s *State) ListUsersWithFilter(filter *types.User) ([]types.User, error) {
 
 // ListAllUsers retrieves all users in the system.
 func (s *State) ListAllUsers() ([]types.User, error) {
-	return s.db.ListUsers()
+	return s.db.ListUsers(nil)
 }
 
 // persistNodeRowToDB writes the node's database row, re-reading the
@@ -644,7 +635,10 @@ func (s *State) Connect(id types.NodeID) ([]change.Change, uint64) {
 		return nil, 0
 	}
 
-	c := []change.Change{change.NodeOnlineFor(node)}
+	// A node coming online sends a lightweight online peer patch. Subnet
+	// routers, relay targets, and via targets get their full peer recompute
+	// from the gated PolicyChange below, so no full update is needed here.
+	c := []change.Change{change.NodeOnline(node.ID())}
 
 	log.Info().EmbedObject(node).Msg("node connected")
 
@@ -727,7 +721,10 @@ func (s *State) Disconnect(id types.NodeID, epoch uint64) ([]change.Change, erro
 	// An ordinary node going offline just sends the lightweight offline
 	// patch; emitting a PolicyChange for it would force every peer to
 	// rebuild its netmap on every disconnect.
-	cs := []change.Change{change.NodeOfflineFor(node), c}
+	// A node going offline sends a lightweight offline peer patch. Subnet
+	// routers and other recompute-forcing nodes rely on the gated
+	// PolicyChange below for the peer recompute, so no full update here.
+	cs := []change.Change{change.NodeOffline(node.ID()), c}
 	if s.polMan.NodeNeedsPeerRecompute(node) {
 		cs = append(cs, change.PolicyChange())
 	}
@@ -771,6 +768,16 @@ func (s *State) ResolveNode(query string) (types.NodeView, bool) {
 		return s.GetNodeByID(id)
 	}
 
+	// keepLowest returns whichever node has the lower ID, so repeated
+	// calls resolve deterministically across snapshot iterations.
+	keepLowest := func(cur, cand types.NodeView) types.NodeView {
+		if !cur.Valid() || cand.ID() < cur.ID() {
+			return cand
+		}
+
+		return cur
+	}
+
 	// Try IP address.
 	addr, addrErr := netip.ParseAddr(query)
 	if addrErr == nil {
@@ -781,9 +788,7 @@ func (s *State) ResolveNode(query string) (types.NodeView, bool) {
 				continue
 			}
 
-			if !match.Valid() || n.ID() < match.ID() {
-				match = n
-			}
+			match = keepLowest(match, n)
 		}
 
 		return match, match.Valid()
@@ -795,13 +800,9 @@ func (s *State) ResolveNode(query string) (types.NodeView, bool) {
 
 	for _, n := range s.ListNodes().All() {
 		if n.GivenName() == query {
-			if !givenMatch.Valid() || n.ID() < givenMatch.ID() {
-				givenMatch = n
-			}
+			givenMatch = keepLowest(givenMatch, n)
 		} else if n.Hostname() == query {
-			if !hostMatch.Valid() || n.ID() < hostMatch.ID() {
-				hostMatch = n
-			}
+			hostMatch = keepLowest(hostMatch, n)
 		}
 	}
 
@@ -2578,7 +2579,7 @@ func (s *State) HandleNodeFromPreAuthKey(
 			Expiry:                 reqExpiry,
 			RegisterMethod:         util.RegisterMethodAuthKey,
 			PreAuthKey:             pak,
-			ExistingNodeForNetinfo: cmp.Or(differentUserNode, types.NodeView{}),
+			ExistingNodeForNetinfo: differentUserNode,
 		})
 		if err != nil {
 			return types.NodeView{}, change.Change{}, fmt.Errorf("creating new node: %w", err)

@@ -24,7 +24,6 @@ import (
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/integration/dockertestutil"
 	"github.com/juanfont/headscale/integration/dsic"
 	"github.com/juanfont/headscale/integration/hsic"
@@ -42,6 +41,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/multierr"
+	"tailscale.com/util/rands"
 )
 
 const (
@@ -197,7 +197,7 @@ func NewScenario(spec ScenarioSpec) (*Scenario, error) {
 		pool.MaxWait = spec.MaxWait
 	}
 
-	testHashPrefix := "hs-" + util.MustGenerateRandomStringDNSSafe(scenarioHashLength)
+	testHashPrefix := "hs-" + rands.HexString(scenarioHashLength)
 	s := &Scenario{
 		controlServers: xsync.NewMap[string, ControlServer](),
 		users:          make(map[string]*User),
@@ -211,7 +211,7 @@ func NewScenario(spec ScenarioSpec) (*Scenario, error) {
 
 	var userToNetwork map[string]*dockertest.Network
 
-	if spec.Networks != nil || len(spec.Networks) != 0 {
+	if spec.Networks != nil {
 		for name, netSpec := range s.spec.Networks {
 			networkName := testHashPrefix + "-" + name
 
@@ -406,8 +406,6 @@ func (s *Scenario) ShutdownAssertNoPanics(t *testing.T) {
 	}
 
 	if s.mockOIDC.r != nil {
-		s.mockOIDC.r.Close()
-
 		err := s.mockOIDC.r.Close()
 		if err != nil {
 			log.Printf("tearing down oidc server: %s", err)
@@ -590,7 +588,8 @@ func (s *Scenario) CreateTailscaleNode(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	opts = append(opts,
+	opts = append(
+		opts,
 		tsic.WithCACert(cert),
 		tsic.WithHeadscaleName(hostname),
 	)
@@ -664,7 +663,8 @@ func (s *Scenario) CreateTailscaleNodesInUser(
 
 			s.mu.Lock()
 
-			opts = append(opts,
+			opts = append(
+				opts,
 				tsic.WithCACert(cert),
 				tsic.WithHeadscaleName(hostname),
 				tsic.WithExtraHosts(extraHosts),
@@ -820,45 +820,29 @@ func (s *Scenario) WaitForTailscaleSyncPerUser(timeout, retryInterval time.Durat
 		}
 	}
 
-	var allErrors []error
-
-	for _, user := range s.users {
-		// Calculate expected peer count: number of nodes in this user minus 1 (self)
-		expectedPeers := len(user.Clients) - 1
-
-		for _, client := range user.Clients {
-			c := client
-			expectedCount := expectedPeers
-
-			user.syncWaitGroup.Go(func() error {
-				return c.WaitForPeers(expectedCount, timeout, retryInterval)
-			})
-		}
-
-		err := user.syncWaitGroup.Wait()
-		if err != nil {
-			allErrors = append(allErrors, err)
-		}
-	}
-
-	if len(allErrors) > 0 {
-		return multierr.New(allErrors...)
-	}
-
-	return nil
+	// Calculate expected peer count: number of nodes in this user minus 1 (self)
+	return s.waitPeers(func(u *User) int { return len(u.Clients) - 1 }, timeout, retryInterval)
 }
 
 // WaitForTailscaleSyncWithPeerCount blocks execution until all the [TailscaleClient] reports
 // to have all other [TailscaleClient]s present in their [netmap.NetworkMap].
 func (s *Scenario) WaitForTailscaleSyncWithPeerCount(peerCount int, timeout, retryInterval time.Duration) error {
+	return s.waitPeers(func(*User) int { return peerCount }, timeout, retryInterval)
+}
+
+// waitPeers blocks until every [TailscaleClient] reports the expected peer
+// count returned by perUser for its owning user, fanning out per user.
+func (s *Scenario) waitPeers(perUser func(*User) int, timeout, retryInterval time.Duration) error {
 	var allErrors []error
 
 	for _, user := range s.users {
+		expectedCount := perUser(user)
+
 		for _, client := range user.Clients {
 			c := client
 
 			user.syncWaitGroup.Go(func() error {
-				return c.WaitForPeers(peerCount, timeout, retryInterval)
+				return c.WaitForPeers(expectedCount, timeout, retryInterval)
 			})
 		}
 
@@ -1415,17 +1399,11 @@ func (s *Scenario) GetIPs(user string) ([]netip.Addr, error) {
 
 // GetClients returns all [TailscaleClient]s associated with a [User] in a [Scenario].
 func (s *Scenario) GetClients(user string) ([]TailscaleClient, error) {
-	var clients []TailscaleClient
-
 	if ns, ok := s.users[user]; ok {
-		for _, client := range ns.Clients {
-			clients = append(clients, client)
-		}
-
-		return clients, nil
+		return xmaps.Values(ns.Clients), nil
 	}
 
-	return clients, fmt.Errorf("getting clients: %w", errNoUserAvailable)
+	return nil, fmt.Errorf("getting clients: %w", errNoUserAvailable)
 }
 
 // ListTailscaleClients returns a list of [TailscaleClient]s given the [User]s
@@ -1593,7 +1571,7 @@ func (s *Scenario) runMockOIDC(accessTTL time.Duration, users []mockoidc.MockUse
 
 	portNotation := fmt.Sprintf("%d/tcp", port)
 
-	hash, _ := util.GenerateRandomStringDNSSafe(hsicOIDCMockHashLength)
+	hash := rands.HexString(hsicOIDCMockHashLength)
 
 	hostname := "hs-oidcmock-" + hash
 
@@ -1638,7 +1616,8 @@ func (s *Scenario) runMockOIDC(accessTTL time.Duration, users []mockoidc.MockUse
 	if pmockoidc, err := s.pool.BuildAndRunWithBuildOptions( //nolint:noinlineerr
 		headscaleBuildOptions,
 		mockOidcOptions,
-		dockertestutil.DockerRestartPolicy); err == nil {
+		dockertestutil.DockerRestartPolicy,
+	); err == nil {
 		s.mockOIDC.r = pmockoidc
 	} else {
 		return err
@@ -1700,7 +1679,7 @@ func Webservice(s *Scenario, networkName string) (*dockertest.Resource, error) {
 	// 	log.Fatalf("finding open port: %s", err)
 	// }
 	// portNotation := fmt.Sprintf("%d/tcp", port)
-	hash := util.MustGenerateRandomStringDNSSafe(hsicOIDCMockHashLength)
+	hash := rands.HexString(hsicOIDCMockHashLength)
 
 	hostname := "hs-webservice-" + hash
 
@@ -1731,7 +1710,8 @@ func Webservice(s *Scenario, networkName string) (*dockertest.Resource, error) {
 	web, err := s.pool.BuildAndRunWithBuildOptions(
 		webBOpts,
 		webOpts,
-		dockertestutil.DockerRestartPolicy)
+		dockertestutil.DockerRestartPolicy,
+	)
 	if err != nil {
 		return nil, err
 	}

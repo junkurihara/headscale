@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
+	"tailscale.com/util/rands"
 	"tailscale.com/util/set"
 )
 
@@ -94,33 +94,9 @@ func CreatePreAuthKey(
 
 	now := time.Now().UTC()
 
-	prefix, err := util.GenerateRandomStringURLSafe(authKeyPrefixLength)
-	if err != nil {
-		return nil, err
-	}
+	prefix := rands.HexString(authKeyPrefixLength)
 
-	// Validate generated prefix (should always be valid, but be defensive)
-	if len(prefix) != authKeyPrefixLength {
-		return nil, fmt.Errorf("%w: generated prefix has invalid length: expected %d, got %d", ErrPreAuthKeyFailedToParse, authKeyPrefixLength, len(prefix))
-	}
-
-	if !isValidBase64URLSafe(prefix) {
-		return nil, fmt.Errorf("%w: generated prefix contains invalid characters", ErrPreAuthKeyFailedToParse)
-	}
-
-	toBeHashed, err := util.GenerateRandomStringURLSafe(authKeyLength)
-	if err != nil {
-		return nil, err
-	}
-
-	// Validate generated hash (should always be valid, but be defensive)
-	if len(toBeHashed) != authKeyLength {
-		return nil, fmt.Errorf("%w: generated hash has invalid length: expected %d, got %d", ErrPreAuthKeyFailedToParse, authKeyLength, len(toBeHashed))
-	}
-
-	if !isValidBase64URLSafe(toBeHashed) {
-		return nil, fmt.Errorf("%w: generated hash contains invalid characters", ErrPreAuthKeyFailedToParse)
-	}
+	toBeHashed := rands.HexString(authKeyLength)
 
 	keyStr := authKeyPrefix + prefix + "-" + toBeHashed
 
@@ -211,60 +187,18 @@ func findAuthKey(tx *gorm.DB, keyStr string) (*types.PreAuthKey, error) {
 	}
 
 	// New format: hskey-auth-{12-char-prefix}-{64-char-hash}
-	// Expected minimum length: 12 (prefix) + 1 (separator) + 64 (hash) = 77
-	const expectedMinLength = authKeyPrefixLength + 1 + authKeyLength
-	if len(prefixAndHash) < expectedMinLength {
-		return nil, fmt.Errorf(
-			"%w: key too short, expected at least %d chars after prefix, got %d",
-			ErrPreAuthKeyFailedToParse,
-			expectedMinLength,
-			len(prefixAndHash),
-		)
-	}
-
-	// Use fixed-length parsing instead of separator-based to handle dashes in base64 URL-safe
-	prefix := prefixAndHash[:authKeyPrefixLength]
-
-	// Validate separator at expected position
-	if prefixAndHash[authKeyPrefixLength] != '-' {
-		return nil, fmt.Errorf(
-			"%w: expected separator '-' at position %d, got '%c'",
-			ErrPreAuthKeyFailedToParse,
-			authKeyPrefixLength,
-			prefixAndHash[authKeyPrefixLength],
-		)
-	}
-
-	hash := prefixAndHash[authKeyPrefixLength+1:]
-
-	// Validate hash length
-	if len(hash) != authKeyLength {
-		return nil, fmt.Errorf(
-			"%w: hash length mismatch, expected %d chars, got %d",
-			ErrPreAuthKeyFailedToParse,
-			authKeyLength,
-			len(hash),
-		)
-	}
-
-	// Validate prefix contains only base64 URL-safe characters
-	if !isValidBase64URLSafe(prefix) {
-		return nil, fmt.Errorf(
-			"%w: prefix contains invalid characters (expected base64 URL-safe: A-Za-z0-9_-)",
-			ErrPreAuthKeyFailedToParse,
-		)
-	}
-
-	// Validate hash contains only base64 URL-safe characters
-	if !isValidBase64URLSafe(hash) {
-		return nil, fmt.Errorf(
-			"%w: hash contains invalid characters (expected base64 URL-safe: A-Za-z0-9_-)",
-			ErrPreAuthKeyFailedToParse,
-		)
+	prefix, hash, err := parsePrefixedKey(
+		prefixAndHash,
+		authKeyPrefixLength,
+		authKeyLength,
+		ErrPreAuthKeyFailedToParse,
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	// Look up key by prefix
-	err := tx.Preload("User").First(&pak, "prefix = ?", prefix).Error
+	err = tx.Preload("User").First(&pak, "prefix = ?", prefix).Error
 	if err != nil {
 		return nil, ErrPreAuthKeyNotFound
 	}
@@ -278,15 +212,77 @@ func findAuthKey(tx *gorm.DB, keyStr string) (*types.PreAuthKey, error) {
 	return &pak, nil
 }
 
-// isValidBase64URLSafe checks if a string contains only base64 URL-safe characters.
-func isValidBase64URLSafe(s string) bool {
-	for _, c := range s {
-		if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && c != '_' {
-			return false
-		}
+// parsePrefixedKey splits the prefix-and-secret portion of a new-format key
+// (the part after the "hskey-*-" prefix) into its fixed-length prefix and
+// secret components, validating the length, separator position, and that both
+// components are base64 URL-safe. Fixed-length parsing is used instead of
+// separator-based to handle dashes in base64 URL-safe characters.
+func parsePrefixedKey(
+	prefixAndSecret string,
+	prefixLen, secretLen int,
+	parseErr error,
+) (string, string, error) {
+	expectedMinLength := prefixLen + 1 + secretLen
+	if len(prefixAndSecret) < expectedMinLength {
+		return "", "", fmt.Errorf(
+			"%w: key too short, expected at least %d chars after prefix, got %d",
+			parseErr,
+			expectedMinLength,
+			len(prefixAndSecret),
+		)
 	}
 
-	return true
+	prefix := prefixAndSecret[:prefixLen]
+
+	// Validate separator at expected position
+	if prefixAndSecret[prefixLen] != '-' {
+		return "", "", fmt.Errorf(
+			"%w: expected separator '-' at position %d, got '%c'",
+			parseErr,
+			prefixLen,
+			prefixAndSecret[prefixLen],
+		)
+	}
+
+	secret := prefixAndSecret[prefixLen+1:]
+
+	// Validate secret length
+	if len(secret) != secretLen {
+		return "", "", fmt.Errorf(
+			"%w: secret length mismatch, expected %d chars, got %d",
+			parseErr,
+			secretLen,
+			len(secret),
+		)
+	}
+
+	// Validate prefix contains only base64 URL-safe characters
+	if !isValidBase64URLSafe(prefix) {
+		return "", "", fmt.Errorf(
+			"%w: prefix contains invalid characters (expected base64 URL-safe: A-Za-z0-9_-)",
+			parseErr,
+		)
+	}
+
+	// Validate secret contains only base64 URL-safe characters
+	if !isValidBase64URLSafe(secret) {
+		return "", "", fmt.Errorf(
+			"%w: secret contains invalid characters (expected base64 URL-safe: A-Za-z0-9_-)",
+			parseErr,
+		)
+	}
+
+	return prefix, secret, nil
+}
+
+// isValidBase64URLSafe reports whether s contains only base64 URL-safe
+// characters (A-Za-z0-9-_). Key material is now generated as hex, a subset of
+// this alphabet, so this accepts both current hex keys and any legacy keys
+// still stored in the database.
+func isValidBase64URLSafe(s string) bool {
+	return !strings.ContainsFunc(s, func(c rune) bool {
+		return (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && c != '_'
+	})
 }
 
 func (hsdb *HSDatabase) GetPreAuthKey(key string) (*types.PreAuthKey, error) {

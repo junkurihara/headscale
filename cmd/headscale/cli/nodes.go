@@ -84,7 +84,8 @@ var registerNodeCmd = &cobra.Command{
 		return printOutput(
 			cmd,
 			response.GetNode(),
-			fmt.Sprintf("Node %s registered", response.GetNode().GetGivenName()))
+			fmt.Sprintf("Node %s registered", response.GetNode().GetGivenName()),
+		)
 	}),
 }
 
@@ -135,7 +136,7 @@ var listNodeRoutesCmd = &cobra.Command{
 		}
 
 		nodes = lo.Filter(nodes, func(n *v1.Node, _ int) bool {
-			return (n.GetSubnetRoutes() != nil && len(n.GetSubnetRoutes()) > 0) || (n.GetApprovedRoutes() != nil && len(n.GetApprovedRoutes()) > 0) || (n.GetAvailableRoutes() != nil && len(n.GetAvailableRoutes()) > 0)
+			return len(n.GetSubnetRoutes()) > 0 || len(n.GetApprovedRoutes()) > 0 || len(n.GetAvailableRoutes()) > 0
 		})
 
 		return printListOutput(cmd, nodes, func() error {
@@ -383,13 +384,7 @@ func nodesToPtables(nodes []*v1.Node) (pterm.TableData, error) {
 			expired = pterm.LightGreen("no")
 		}
 
-		var tagsBuilder strings.Builder
-
-		for _, tag := range node.GetTags() {
-			tagsBuilder.WriteString("\n" + tag)
-		}
-
-		tags := strings.TrimLeft(tagsBuilder.String(), "\n")
+		tags := strings.Join(node.GetTags(), "\n")
 
 		var user string
 		if node.GetUser() != nil {

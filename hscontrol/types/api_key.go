@@ -9,12 +9,8 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-const (
-	// NewAPIKeyPrefixLength is the length of the prefix for new API keys.
-	NewAPIKeyPrefixLength = 12
-	// LegacyAPIKeyPrefixLength is the length of the prefix for legacy API keys.
-	LegacyAPIKeyPrefixLength = 7
-)
+// NewAPIKeyPrefixLength is the length of the prefix for new API keys.
+const NewAPIKeyPrefixLength = 12
 
 // APIKey describes the datamodel for API keys used to remotely authenticate with
 // headscale.
@@ -33,14 +29,7 @@ func (key *APIKey) Proto() *v1.ApiKey {
 		Id: key.ID,
 	}
 
-	// Show prefix format: distinguish between new (12-char) and legacy (7-char) keys
-	if len(key.Prefix) == NewAPIKeyPrefixLength {
-		// New format key (12-char prefix)
-		protoKey.Prefix = "hskey-api-" + key.Prefix + "-***"
-	} else {
-		// Legacy format key (7-char prefix) or fallback
-		protoKey.Prefix = key.Prefix + "***"
-	}
+	protoKey.Prefix = key.maskedPrefix()
 
 	if key.Expiration != nil {
 		protoKey.Expiration = timestamppb.New(*key.Expiration)
