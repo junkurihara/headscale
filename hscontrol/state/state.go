@@ -277,7 +277,7 @@ func NewState(cfg *types.Config) (*State, error) {
 	)
 	nodeStore.Start()
 
-	return &State{
+	s := &State{
 		cfg: cfg,
 
 		db:        db,
@@ -289,7 +289,14 @@ func NewState(cfg *types.Config) (*State, error) {
 
 		sshCheckAuth:  make(map[sshCheckPair]time.Time),
 		registerLocks: xsync.NewMap[key.MachinePublic, *sync.Mutex](),
-	}, nil
+	}
+
+	// Surface nodes whose stored data would break map generation (e.g. an
+	// invalid given name from a legacy row) so an operator can fix them. This
+	// only logs; it never mutates a node's stored name at boot.
+	s.logNodeHealth()
+
+	return s, nil
 }
 
 // Close gracefully shuts down the [State] instance and releases all resources.
@@ -1032,9 +1039,12 @@ func (s *State) SetApprovedRoutes(nodeID types.NodeID, routes []netip.Prefix) (t
 // auto-sanitisation) and collisions error out rather than silently
 // bumping a user-facing label. See HOSTNAME.md for the CLI contract.
 func (s *State) RenameNode(nodeID types.NodeID, newName string) (types.NodeView, change.Change, error) {
-	err := dnsname.ValidLabel(newName)
+	// Validate the label AND that the resulting FQDN fits MaxHostnameLength:
+	// a valid 63-char label can still overflow under a long base_domain, and
+	// an unmappable name would break this node and its peers (issue #3346).
+	err := types.ValidateGivenName(newName, s.cfg.BaseDomain)
 	if err != nil {
-		return types.NodeView{}, change.Change{}, fmt.Errorf("renaming node: %w", err)
+		return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %w", ErrGivenNameInvalid, err)
 	}
 
 	view, err := s.nodeStore.SetGivenName(nodeID, newName)
@@ -1373,6 +1383,17 @@ func (s *State) ValidateAPIKey(keyStr string) (bool, error) {
 	return s.db.ValidateAPIKey(keyStr)
 }
 
+// AuthenticateAPIKey validates an API key and returns it (with its owning
+// user), so callers like the v2 API can act as the key's owner.
+func (s *State) AuthenticateAPIKey(keyStr string) (*types.APIKey, error) {
+	return s.db.AuthenticateAPIKey(keyStr)
+}
+
+// SetAPIKeyUser sets the owning user of an API key by its database ID.
+func (s *State) SetAPIKeyUser(keyID uint64, userID types.UserID) error {
+	return s.db.SetAPIKeyUser(keyID, userID)
+}
+
 // CreateAPIKey generates a new API key with optional expiration.
 func (s *State) CreateAPIKey(expiration *time.Time) (string, *types.APIKey, error) {
 	return s.db.CreateAPIKey(expiration)
@@ -1457,14 +1478,37 @@ func (s *State) DB() *hsdb.HSDatabase {
 	return s.db
 }
 
-// GetPreAuthKey retrieves a pre-authentication key by ID.
-func (s *State) GetPreAuthKey(id string) (*types.PreAuthKey, error) {
-	return s.db.GetPreAuthKey(id)
+// GetPreAuthKey retrieves a pre-authentication key by its secret. The caller is
+// responsible for checking whether the key is usable (expired or used).
+func (s *State) GetPreAuthKey(keyStr string) (*types.PreAuthKey, error) {
+	return s.db.GetPreAuthKey(keyStr)
+}
+
+// GetPreAuthKeyByID retrieves a pre-authentication key by its database id.
+func (s *State) GetPreAuthKeyByID(id uint64) (*types.PreAuthKey, error) {
+	return s.db.GetPreAuthKeyByID(id)
+}
+
+// RevokePreAuthKey soft-revokes a pre-authentication key: it is kept and stays
+// retrievable (invalid) until the collector reaps it after the retention window.
+func (s *State) RevokePreAuthKey(id uint64) error {
+	return s.db.RevokePreAuthKey(id)
+}
+
+// DestroyRevokedPreAuthKeysBefore hard-deletes pre-auth keys revoked before
+// cutoff, returning how many were removed.
+func (s *State) DestroyRevokedPreAuthKeysBefore(cutoff time.Time) (int, error) {
+	return s.db.DestroyRevokedPreAuthKeysBefore(cutoff)
 }
 
 // ListPreAuthKeys returns all pre-authentication keys for a user.
 func (s *State) ListPreAuthKeys() ([]types.PreAuthKey, error) {
 	return s.db.ListPreAuthKeys()
+}
+
+// SetPreAuthKeyDescription sets the free-text description on a pre-auth key.
+func (s *State) SetPreAuthKeyDescription(id uint64, description string) error {
+	return s.db.SetPreAuthKeyDescription(id, description)
 }
 
 // ExpirePreAuthKey marks a pre-authentication key as expired.
@@ -1475,6 +1519,63 @@ func (s *State) ExpirePreAuthKey(id uint64) error {
 // DeletePreAuthKey permanently deletes a pre-authentication key.
 func (s *State) DeletePreAuthKey(id uint64) error {
 	return s.db.DeletePreAuthKey(id)
+}
+
+// CreateOAuthClient creates a new OAuth client-credentials client, returning the
+// plaintext secret (shown once) and the stored client.
+func (s *State) CreateOAuthClient(scopes, tags []string, description string, creatorUserID *uint) (string, *types.OAuthClient, error) {
+	return s.db.CreateOAuthClient(scopes, tags, description, creatorUserID)
+}
+
+// AuthenticateOAuthClient validates a client secret and returns the client.
+func (s *State) AuthenticateOAuthClient(secret string) (*types.OAuthClient, error) {
+	return s.db.AuthenticateOAuthClient(secret)
+}
+
+// GetOAuthClientByClientID returns an OAuth client by its public client id.
+func (s *State) GetOAuthClientByClientID(clientID string) (*types.OAuthClient, error) {
+	return s.db.GetOAuthClientByClientID(clientID)
+}
+
+// ListOAuthClients returns every OAuth client.
+func (s *State) ListOAuthClients() ([]types.OAuthClient, error) {
+	return s.db.ListOAuthClients()
+}
+
+// RevokeOAuthClient deletes a client and the access tokens it issued.
+func (s *State) RevokeOAuthClient(clientID string) error {
+	return s.db.RevokeOAuthClient(clientID)
+}
+
+// MintAccessToken stores a new scoped access token for an OAuth client.
+func (s *State) MintAccessToken(clientID string, scopes, tags []string, expiration *time.Time) (string, *types.OAuthAccessToken, error) {
+	return s.db.MintAccessToken(clientID, scopes, tags, expiration)
+}
+
+// AuthenticateAccessToken validates a bearer access token and returns it with
+// its granted scopes and tags.
+func (s *State) AuthenticateAccessToken(token string) (*types.OAuthAccessToken, error) {
+	return s.db.AuthenticateAccessToken(token)
+}
+
+// TagOwnedByTags reports whether a credential holding ownerTags may apply tag,
+// per the policy's tag-to-tag ownership. Used to authorise the tags an OAuth
+// access token sets on the auth keys it mints.
+func (s *State) TagOwnedByTags(tag string, ownerTags []string) bool {
+	return s.polMan.TagOwnedByTags(tag, ownerTags)
+}
+
+// TagExists reports whether tag is defined in the policy's tagOwners. Used to
+// reject OAuth clients and auth keys carrying tags that no policy authorises,
+// matching SetNodeTags.
+func (s *State) TagExists(tag string) bool {
+	return s.polMan.TagExists(tag)
+}
+
+// DeleteExpiredAccessTokens hard-deletes OAuth access tokens that expired before
+// cutoff, returning how many were removed.
+func (s *State) DeleteExpiredAccessTokens(cutoff time.Time) (int64, error) {
+	return s.db.DeleteExpiredAccessTokens(cutoff)
 }
 
 // GetAuthCacheEntry retrieves a pending auth request from the cache.
@@ -1793,7 +1894,7 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 		if params.PreAuthKey.IsTagged() {
 			// Tagged nodes are owned by their tags, not a user.
 			// UserID is intentionally left nil.
-			nodeToRegister.Tags = params.PreAuthKey.Proto().GetAclTags()
+			nodeToRegister.Tags = params.PreAuthKey.Tags
 
 			// Tagged nodes have key expiry disabled.
 			nodeToRegister.Expiry = nil
@@ -2427,11 +2528,12 @@ func (s *State) HandleNodeFromPreAuthKey(
 			// user-less and never expire). Only update AuthKey reference
 			// otherwise.
 			if pak.IsTagged() && !node.IsTagged() {
-				node.Tags = pak.Proto().GetAclTags()
+				node.Tags = pak.Tags
 				node.UserID = nil
 				node.User = nil
 				node.Expiry = nil
 			}
+
 			node.AuthKey = pak
 			node.AuthKeyID = &pak.ID
 			// Do NOT reset IsOnline here. Online status is managed exclusively by
@@ -2793,7 +2895,7 @@ func isAutoDerivedGivenName(given, hostname string) bool {
 // - node.PeerChangeFromMapRequest
 // - node.ApplyPeerChange
 // - logTracePeerChange in poll.go.
-func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest) (change.Change, error) {
+func (s *State) UpdateNodeFromMapRequest(id types.NodeID, req tailcfg.MapRequest) (change.Change, error) { //nolint:gocyclo // central map-request reconciliation; the sequential branch flow reads clearer as one function than split across helpers
 	log.Trace().
 		Caller().
 		Uint64(zf.NodeID, id.Uint64()).

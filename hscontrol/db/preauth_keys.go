@@ -25,6 +25,26 @@ var (
 	ErrPreAuthKeyACLTagInvalid     = errors.New("auth-key tag is invalid")
 )
 
+// validateACLTags deduplicates, sorts, and checks that every tag carries the
+// "tag:" prefix. Shared by the pre-auth-key and OAuth credential paths so both
+// enforce the same tag shape.
+func validateACLTags(tags []string) ([]string, error) {
+	tags = set.SetOf(tags).Slice()
+	slices.Sort(tags)
+
+	for _, tag := range tags {
+		if !strings.HasPrefix(tag, "tag:") {
+			return nil, fmt.Errorf(
+				"%w: '%s' did not begin with 'tag:'",
+				ErrPreAuthKeyACLTagInvalid,
+				tag,
+			)
+		}
+	}
+
+	return tags, nil
+}
+
 func (hsdb *HSDatabase) CreatePreAuthKey(
 	uid *types.UserID,
 	reusable bool,
@@ -76,20 +96,9 @@ func CreatePreAuthKey(
 		userID = &user.ID
 	}
 
-	// Remove duplicates and sort for consistency
-	aclTags = set.SetOf(aclTags).Slice()
-	slices.Sort(aclTags)
-
-	// TODO(kradalby): factor out and create a reusable tag validation,
-	// check if there is one in Tailscale's lib.
-	for _, tag := range aclTags {
-		if !strings.HasPrefix(tag, "tag:") {
-			return nil, fmt.Errorf(
-				"%w: '%s' did not begin with 'tag:'",
-				ErrPreAuthKeyACLTagInvalid,
-				tag,
-			)
-		}
+	aclTags, err := validateACLTags(aclTags)
+	if err != nil {
+		return nil, err
 	}
 
 	now := time.Now().UTC()
@@ -131,6 +140,15 @@ func CreatePreAuthKey(
 		CreatedAt:  key.CreatedAt,
 		User:       key.User,
 	}, nil
+}
+
+// SetPreAuthKeyDescription sets the free-text description on a pre-auth key.
+// The v2 keys API sets it after creation rather than threading it through the
+// many-armed CreatePreAuthKey signature shared by every other caller.
+func (hsdb *HSDatabase) SetPreAuthKeyDescription(id uint64, description string) error {
+	return hsdb.DB.Model(&types.PreAuthKey{}).
+		Where("id = ?", id).
+		Update("description", description).Error
 }
 
 func (hsdb *HSDatabase) ListPreAuthKeys() ([]types.PreAuthKey, error) {
@@ -219,6 +237,7 @@ func findAuthKey(tx *gorm.DB, keyStr string) (*types.PreAuthKey, error) {
 // separator-based to handle dashes in base64 URL-safe characters.
 func parsePrefixedKey(
 	prefixAndSecret string,
+	//nolint:unparam // kept explicit though every credential kind uses a 12-char prefix and 64-char secret today
 	prefixLen, secretLen int,
 	parseErr error,
 ) (string, string, error) {
@@ -295,6 +314,20 @@ func GetPreAuthKey(tx *gorm.DB, key string) (*types.PreAuthKey, error) {
 	return findAuthKey(tx, key)
 }
 
+// GetPreAuthKeyByID returns a [types.PreAuthKey] by its primary key, with the
+// owning user preloaded.
+func (hsdb *HSDatabase) GetPreAuthKeyByID(id uint64) (*types.PreAuthKey, error) {
+	pak := types.PreAuthKey{}
+	// Explicit primary-key clause: a struct condition would drop a zero-valued
+	// ID, making the lookup unconditional and returning the first row instead
+	// of not-found.
+	if result := hsdb.DB.Preload("User").First(&pak, "id = ?", id); result.Error != nil {
+		return nil, result.Error
+	}
+
+	return &pak, nil
+}
+
 // DestroyPreAuthKey destroys a preauthkey. Returns error if the [types.PreAuthKey]
 // does not exist. This also clears the auth_key_id on any nodes that reference
 // this key.
@@ -309,9 +342,13 @@ func DestroyPreAuthKey(tx *gorm.DB, id uint64) error {
 		}
 
 		// Then delete the pre-auth key
-		err = tx.Unscoped().Delete(&types.PreAuthKey{}, id).Error
-		if err != nil {
-			return err
+		res := tx.Unscoped().Delete(&types.PreAuthKey{}, id)
+		if res.Error != nil {
+			return res.Error
+		}
+
+		if res.RowsAffected == 0 {
+			return ErrPreAuthKeyNotFound
 		}
 
 		return nil
@@ -328,6 +365,63 @@ func (hsdb *HSDatabase) DeletePreAuthKey(id uint64) error {
 	return hsdb.Write(func(tx *gorm.DB) error {
 		return DestroyPreAuthKey(tx, id)
 	})
+}
+
+func (hsdb *HSDatabase) RevokePreAuthKey(id uint64) error {
+	return hsdb.Write(func(tx *gorm.DB) error {
+		return RevokePreAuthKey(tx, id)
+	})
+}
+
+// RevokePreAuthKey soft-revokes a key (the v2 API's DELETE): the row is kept and
+// stays retrievable with its invalid flag set, but the key can no longer
+// authorize nodes. The background collector hard-deletes it after the retention
+// window. An already-revoked or unknown id returns [ErrPreAuthKeyNotFound], so a
+// repeated DELETE is a clean 404.
+func RevokePreAuthKey(tx *gorm.DB, id uint64) error {
+	res := tx.Model(&types.PreAuthKey{}).
+		Where("id = ? AND revoked IS NULL", id).
+		Update("revoked", time.Now())
+	if res.Error != nil {
+		return res.Error
+	}
+
+	if res.RowsAffected == 0 {
+		return ErrPreAuthKeyNotFound
+	}
+
+	return nil
+}
+
+// DestroyRevokedPreAuthKeysBefore hard-deletes every key revoked before cutoff,
+// returning how many were removed. The background collector calls this to reap
+// soft-revoked keys after the retention window.
+func (hsdb *HSDatabase) DestroyRevokedPreAuthKeysBefore(cutoff time.Time) (int, error) {
+	var count int
+
+	err := hsdb.Write(func(tx *gorm.DB) error {
+		var ids []uint64
+
+		err := tx.Model(&types.PreAuthKey{}).
+			Where("revoked IS NOT NULL AND revoked < ?", cutoff).
+			Pluck("id", &ids).Error
+		if err != nil {
+			return err
+		}
+
+		for _, id := range ids {
+			err := DestroyPreAuthKey(tx, id)
+			if err != nil {
+				return err
+			}
+		}
+
+		count = len(ids)
+
+		return nil
+	})
+
+	return count, err
 }
 
 // UsePreAuthKey atomically marks a [types.PreAuthKey] as used. The UPDATE is
@@ -353,8 +447,19 @@ func UsePreAuthKey(tx *gorm.DB, k *types.PreAuthKey) error {
 	return nil
 }
 
-// ExpirePreAuthKey marks a [types.PreAuthKey] as expired.
+// ExpirePreAuthKey marks a [types.PreAuthKey] as expired, returning
+// [ErrPreAuthKeyNotFound] rather than succeeding silently when no such key exists.
 func ExpirePreAuthKey(tx *gorm.DB, id uint64) error {
 	now := time.Now()
-	return tx.Model(&types.PreAuthKey{}).Where("id = ?", id).Update("expiration", now).Error
+
+	res := tx.Model(&types.PreAuthKey{}).Where("id = ?", id).Update("expiration", now)
+	if res.Error != nil {
+		return res.Error
+	}
+
+	if res.RowsAffected == 0 {
+		return ErrPreAuthKeyNotFound
+	}
+
+	return nil
 }

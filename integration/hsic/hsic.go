@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,7 +25,8 @@ import (
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	clientv1 "github.com/juanfont/headscale/gen/client/v1"
+	clientv2 "github.com/juanfont/headscale/gen/client/v2"
 	"github.com/juanfont/headscale/hscontrol"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -1023,6 +1025,90 @@ func (t *HeadscaleInContainer) GetEndpoint() string {
 	return t.getEndpoint(false)
 }
 
+var errOAuthSecretMissing = errors.New(`OAuth client response missing secret in "key" field`)
+
+// CreateOAuthClient mints an admin API key and uses it to create an OAuth client
+// via the v2 keys HTTP API (POST /api/v2/tailnet/-/keys, keyType=client),
+// returning the client id and secret. The secret is only returned once, in the
+// "key" field. It is a reusable building block for tests that need OAuth client
+// credentials (such as the Kubernetes operator).
+func (t *HeadscaleInContainer) CreateOAuthClient(
+	ctx context.Context,
+	scopes, tags []string,
+) (string, string, error) {
+	apiKey, err := t.Execute([]string{"headscale", "apikeys", "create", "--expiration", "24h"})
+	if err != nil {
+		return "", "", fmt.Errorf("creating admin api key: %w", err)
+	}
+
+	apiKey = strings.TrimSpace(apiKey)
+
+	client, err := clientv2.NewClientWithResponses(
+		t.GetEndpoint(),
+		clientv2.WithHTTPClient(t.httpClient()),
+		clientv2.WithRequestEditorFn(func(_ context.Context, req *http.Request) error {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+
+			return nil
+		}),
+	)
+	if err != nil {
+		return "", "", fmt.Errorf("building v2 API client: %w", err)
+	}
+
+	keyType := "client"
+
+	resp, err := client.CreateKeyWithResponse(ctx, "-", clientv2.CreateKeyRequest{
+		KeyType: &keyType,
+		Scopes:  &scopes,
+		Tags:    &tags,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("creating OAuth client: %w", err)
+	}
+
+	if resp.JSON200 == nil {
+		return "", "", fmt.Errorf( //nolint:err113
+			"creating OAuth client: status %s: %s", resp.Status(), strings.TrimSpace(string(resp.Body)))
+	}
+
+	if resp.JSON200.Key == nil || *resp.JSON200.Key == "" {
+		return "", "", errOAuthSecretMissing
+	}
+
+	// The operator expects clientId and clientSecret as separate values. When the
+	// server returns a single opaque credential, the client-credentials grant
+	// splits it on "-" (id-secret), matching the Tailscale SaaS shape. Fall back
+	// to the whole key as the secret when no id is given.
+	clientID, clientSecret := resp.JSON200.Id, *resp.JSON200.Key
+
+	if clientID == "" {
+		if id, secret, ok := strings.Cut(*resp.JSON200.Key, "-"); ok {
+			clientID, clientSecret = id, secret
+		}
+	}
+
+	return clientID, clientSecret, nil
+}
+
+// httpClient returns an HTTP client that trusts this Headscale's TLS CA when TLS
+// is enabled, or a default client when it serves plain HTTP.
+func (t *HeadscaleInContainer) httpClient() *http.Client {
+	if !t.hasTLS() {
+		return &http.Client{Timeout: 30 * time.Second}
+	}
+
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(t.tlsCACert)
+
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+		},
+	}
+}
+
 // GetIPEndpoint returns the Headscale endpoint using IP address instead of hostname.
 func (t *HeadscaleInContainer) GetIPEndpoint() string {
 	return t.getEndpoint(true)
@@ -1095,7 +1181,7 @@ func (t *HeadscaleInContainer) WaitForRunning() error {
 // CreateUser adds a new user to the Headscale instance.
 func (t *HeadscaleInContainer) CreateUser(
 	user string,
-) (*v1.User, error) {
+) (*clientv1.User, error) {
 	command := []string{
 		binHeadscale,
 		"users",
@@ -1115,7 +1201,7 @@ func (t *HeadscaleInContainer) CreateUser(
 		return nil, err
 	}
 
-	var u v1.User
+	var u clientv1.User
 
 	err = json.Unmarshal([]byte(result), &u)
 	if err != nil {
@@ -1140,7 +1226,7 @@ type AuthKeyOptions struct {
 
 // CreateAuthKeyWithOptions creates a new "authorisation key" with the specified options.
 // This supports both user-owned and tags-only auth keys.
-func (t *HeadscaleInContainer) CreateAuthKeyWithOptions(opts AuthKeyOptions) (*v1.PreAuthKey, error) {
+func (t *HeadscaleInContainer) CreateAuthKeyWithOptions(opts AuthKeyOptions) (*clientv1.PreAuthKey, error) {
 	command := []string{
 		binHeadscale,
 	}
@@ -1181,7 +1267,7 @@ func (t *HeadscaleInContainer) CreateAuthKeyWithOptions(opts AuthKeyOptions) (*v
 		return nil, fmt.Errorf("executing create auth key command: %w", err)
 	}
 
-	var preAuthKey v1.PreAuthKey
+	var preAuthKey clientv1.PreAuthKey
 
 	err = json.Unmarshal([]byte(result), &preAuthKey)
 	if err != nil {
@@ -1197,7 +1283,7 @@ func (t *HeadscaleInContainer) CreateAuthKey(
 	user uint64,
 	reusable bool,
 	ephemeral bool,
-) (*v1.PreAuthKey, error) {
+) (*clientv1.PreAuthKey, error) {
 	return t.CreateAuthKeyWithOptions(AuthKeyOptions{
 		User:      &user,
 		Reusable:  reusable,
@@ -1212,7 +1298,7 @@ func (t *HeadscaleInContainer) CreateAuthKeyWithTags(
 	reusable bool,
 	ephemeral bool,
 	tags []string,
-) (*v1.PreAuthKey, error) {
+) (*clientv1.PreAuthKey, error) {
 	return t.CreateAuthKeyWithOptions(AuthKeyOptions{
 		User:      &user,
 		Reusable:  reusable,
@@ -1252,8 +1338,8 @@ func (t *HeadscaleInContainer) DeleteAuthKey(
 // specific users.
 func (t *HeadscaleInContainer) ListNodes(
 	users ...string,
-) ([]*v1.Node, error) {
-	var ret []*v1.Node
+) ([]*clientv1.Node, error) {
+	var ret []*clientv1.Node
 
 	execUnmarshal := func(command []string) error {
 		result, _, err := dockertestutil.ExecuteCommand(
@@ -1265,7 +1351,7 @@ func (t *HeadscaleInContainer) ListNodes(
 			return fmt.Errorf("executing list node command: %w", err)
 		}
 
-		var nodes []*v1.Node
+		var nodes []*clientv1.Node
 
 		err = json.Unmarshal([]byte(result), &nodes)
 		if err != nil {
@@ -1293,8 +1379,11 @@ func (t *HeadscaleInContainer) ListNodes(
 		}
 	}
 
-	slices.SortFunc(ret, func(a, b *v1.Node) int {
-		return cmp.Compare(a.GetId(), b.GetId())
+	slices.SortFunc(ret, func(a, b *clientv1.Node) int {
+		ai, _ := strconv.ParseUint(a.Id, 10, 64)
+		bi, _ := strconv.ParseUint(b.Id, 10, 64)
+
+		return cmp.Compare(ai, bi)
 	})
 
 	return ret, nil
@@ -1324,37 +1413,38 @@ func (t *HeadscaleInContainer) DeleteNode(nodeID uint64) error {
 	return nil
 }
 
-func (t *HeadscaleInContainer) NodesByUser() (map[string][]*v1.Node, error) {
+func (t *HeadscaleInContainer) NodesByUser() (map[string][]*clientv1.Node, error) {
 	nodes, err := t.ListNodes()
 	if err != nil {
 		return nil, err
 	}
 
-	userMap := make(map[string][]*v1.Node)
+	userMap := make(map[string][]*clientv1.Node)
+
 	for _, node := range nodes {
-		name := node.GetUser().GetName()
+		name := node.User.Name
 		userMap[name] = append(userMap[name], node)
 	}
 
 	return userMap, nil
 }
 
-func (t *HeadscaleInContainer) NodesByName() (map[string]*v1.Node, error) {
+func (t *HeadscaleInContainer) NodesByName() (map[string]*clientv1.Node, error) {
 	nodes, err := t.ListNodes()
 	if err != nil {
 		return nil, err
 	}
 
-	var nameMap map[string]*v1.Node
+	var nameMap map[string]*clientv1.Node
 	for _, node := range nodes {
-		mak.Set(&nameMap, node.GetName(), node)
+		mak.Set(&nameMap, node.Name, node)
 	}
 
 	return nameMap, nil
 }
 
 // ListUsers returns a list of users from Headscale.
-func (t *HeadscaleInContainer) ListUsers() ([]*v1.User, error) {
+func (t *HeadscaleInContainer) ListUsers() ([]*clientv1.User, error) {
 	command := []string{binHeadscale, "users", "list", flagOutput, "json"}
 
 	result, _, err := dockertestutil.ExecuteCommand(
@@ -1366,7 +1456,7 @@ func (t *HeadscaleInContainer) ListUsers() ([]*v1.User, error) {
 		return nil, fmt.Errorf("executing list node command: %w", err)
 	}
 
-	var users []*v1.User
+	var users []*clientv1.User
 
 	err = json.Unmarshal([]byte(result), &users)
 	if err != nil {
@@ -1378,15 +1468,15 @@ func (t *HeadscaleInContainer) ListUsers() ([]*v1.User, error) {
 
 // MapUsers returns a map of users from Headscale. It is keyed by the
 // user name.
-func (t *HeadscaleInContainer) MapUsers() (map[string]*v1.User, error) {
+func (t *HeadscaleInContainer) MapUsers() (map[string]*clientv1.User, error) {
 	users, err := t.ListUsers()
 	if err != nil {
 		return nil, err
 	}
 
-	var userMap map[string]*v1.User
+	var userMap map[string]*clientv1.User
 	for _, user := range users {
-		mak.Set(&userMap, user.GetName(), user)
+		mak.Set(&userMap, user.Name, user)
 	}
 
 	return userMap, nil
@@ -1545,7 +1635,7 @@ func (h *HeadscaleInContainer) Restart() error {
 }
 
 // ApproveRoutes approves routes for a node.
-func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (*v1.Node, error) {
+func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (*clientv1.Node, error) {
 	command := []string{
 		binHeadscale, "nodes", "approve-routes",
 		flagOutput, "json",
@@ -1567,7 +1657,7 @@ func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (
 		)
 	}
 
-	var node *v1.Node
+	var node *clientv1.Node
 
 	err = json.Unmarshal([]byte(result), &node)
 	if err != nil {

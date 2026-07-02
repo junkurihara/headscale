@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	clientv1 "github.com/juanfont/headscale/gen/client/v1"
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/integration/dockertestutil"
@@ -183,6 +183,26 @@ func NewScenario(spec ScenarioSpec) (*Scenario, error) {
 	pool, err := dockertest.NewPool("")
 	if err != nil {
 		return nil, fmt.Errorf("connecting to docker: %w", err)
+	}
+
+	// dockertest's bundled go-dockerclient stamps image builds with API
+	// v1.25 (the `ver` tag on BuildImageOptions.Dockerfile) whenever the
+	// client has no pinned version. Docker Engine 29 raised the minimum API
+	// version to 1.40 and rejects v1.25 with a 400, which surfaces mid-build
+	// as a "write: broken pipe". Pin the client to the daemon's reported API
+	// version so build (and every other) request uses an accepted path.
+	version, err := pool.Client.Version()
+	if err != nil {
+		return nil, fmt.Errorf("querying docker API version: %w", err)
+	}
+
+	if api := version.Get("ApiVersion"); api != "" {
+		client, err := docker.NewVersionedClientFromEnv(api)
+		if err != nil {
+			return nil, fmt.Errorf("pinning docker client to API version %s: %w", api, err)
+		}
+
+		pool.Client = client
 	}
 
 	// Opportunity to clean up unreferenced networks.
@@ -500,7 +520,7 @@ func (s *Scenario) CreatePreAuthKey(
 	user uint64,
 	reusable bool,
 	ephemeral bool,
-) (*v1.PreAuthKey, error) {
+) (*clientv1.PreAuthKey, error) {
 	if headscale, err := s.Headscale(); err == nil { //nolint:noinlineerr
 		key, err := headscale.CreateAuthKey(user, reusable, ephemeral)
 		if err != nil {
@@ -515,7 +535,7 @@ func (s *Scenario) CreatePreAuthKey(
 
 // CreatePreAuthKeyWithOptions creates a "pre authorised key" with the specified options
 // to be created in the Headscale instance on behalf of the [Scenario].
-func (s *Scenario) CreatePreAuthKeyWithOptions(opts hsic.AuthKeyOptions) (*v1.PreAuthKey, error) {
+func (s *Scenario) CreatePreAuthKeyWithOptions(opts hsic.AuthKeyOptions) (*clientv1.PreAuthKey, error) {
 	headscale, err := s.Headscale()
 	if err != nil {
 		return nil, fmt.Errorf("creating preauth key with options: %w", errNoHeadscaleAvailable)
@@ -536,7 +556,7 @@ func (s *Scenario) CreatePreAuthKeyWithTags(
 	reusable bool,
 	ephemeral bool,
 	tags []string,
-) (*v1.PreAuthKey, error) {
+) (*clientv1.PreAuthKey, error) {
 	headscale, err := s.Headscale()
 	if err != nil {
 		return nil, fmt.Errorf("creating preauth key with tags: %w", errNoHeadscaleAvailable)
@@ -552,7 +572,7 @@ func (s *Scenario) CreatePreAuthKeyWithTags(
 
 // CreateUser creates a [User] to be created in the
 // Headscale instance on behalf of the [Scenario].
-func (s *Scenario) CreateUser(user string) (*v1.User, error) {
+func (s *Scenario) CreateUser(user string) (*clientv1.User, error) {
 	if headscale, err := s.Headscale(); err == nil { //nolint:noinlineerr
 		u, err := headscale.CreateUser(user)
 		if err != nil {
@@ -905,7 +925,7 @@ func (s *Scenario) createHeadscaleEnvWithTags(
 	}
 
 	for _, user := range s.spec.Users {
-		var u *v1.User
+		var u *clientv1.User
 
 		if s.spec.OIDCSkipUserCreation {
 			// Only register locally — OIDC login will create the headscale user.
@@ -944,18 +964,18 @@ func (s *Scenario) createHeadscaleEnvWithTags(
 			}
 		} else {
 			// Use tagged PreAuthKey if tags are provided (tags-as-identity model)
-			var key *v1.PreAuthKey
+			var key *clientv1.PreAuthKey
 			if len(preAuthKeyTags) > 0 {
-				key, err = s.CreatePreAuthKeyWithTags(u.GetId(), true, false, preAuthKeyTags)
+				key, err = s.CreatePreAuthKeyWithTags(mustParseID(u.Id), true, false, preAuthKeyTags)
 			} else {
-				key, err = s.CreatePreAuthKey(u.GetId(), true, false)
+				key, err = s.CreatePreAuthKey(mustParseID(u.Id), true, false)
 			}
 
 			if err != nil {
 				return err
 			}
 
-			err = s.RunTailscaleUp(user, headscale.GetEndpoint(), key.GetKey())
+			err = s.RunTailscaleUp(user, headscale.GetEndpoint(), key.Key)
 			if err != nil {
 				return err
 			}

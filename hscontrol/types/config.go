@@ -33,6 +33,9 @@ const (
 
 var (
 	errOidcMutuallyExclusive     = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
+	errOIDCIssuerInvalid         = errors.New("oidc.issuer must be a valid http(s) URL")
+	errOIDCClientIDRequired      = errors.New("oidc.client_id is required when oidc.issuer is set")
+	errOIDCClientSecretRequired  = errors.New("oidc.client_secret or oidc.client_secret_path is required when oidc.issuer is set")
 	errServerURLSuffix           = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
 	errServerURLSame             = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
 	errInvalidPKCEMethod         = errors.New("pkce.method must be either 'plain' or 'S256'")
@@ -78,6 +81,14 @@ type RouteConfig struct {
 	HA HARouteConfig
 }
 
+// PreAuthKeysConfig contains configuration for pre-auth key lifecycle.
+type PreAuthKeysConfig struct {
+	// RevokedRetention is how long a soft-revoked pre-auth key (revoked via the
+	// v2 API's DELETE) is kept retrievable before the background collector
+	// hard-deletes it. A zero or negative duration disables the collector.
+	RevokedRetention time.Duration
+}
+
 // NodeConfig contains configuration for node lifecycle and expiry.
 type NodeConfig struct {
 	// Expiry is the default key expiry duration for non-tagged nodes.
@@ -98,10 +109,9 @@ type Config struct {
 	ServerURL           string
 	Addr                string
 	MetricsAddr         string
-	GRPCAddr            string
-	GRPCAllowInsecure   bool
 	TrustedProxies      []netip.Prefix
 	Node                NodeConfig
+	PreAuthKeys         PreAuthKeysConfig
 	PrefixV4            *netip.Prefix
 	PrefixV6            *netip.Prefix
 	IPAllocation        IPAllocationStrategy
@@ -356,6 +366,35 @@ func validatePKCEMethod(method string) error {
 	return nil
 }
 
+// validateOIDCConfig validates the OIDC settings, called when oidc.issuer is
+// set. It fails fast on a setup that cannot work: an invalid PKCE method, a
+// malformed issuer URL (which would otherwise surface as an opaque discovery
+// error or, worse, resolve to an unintended provider), or a missing client
+// id/secret.
+func validateOIDCConfig() error {
+	err := validatePKCEMethod(viper.GetString("oidc.pkce.method"))
+	if err != nil {
+		return err
+	}
+
+	issuer := viper.GetString("oidc.issuer")
+
+	u, err := url.Parse(issuer)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return fmt.Errorf("%w: got %q", errOIDCIssuerInvalid, issuer)
+	}
+
+	if viper.GetString("oidc.client_id") == "" {
+		return errOIDCClientIDRequired
+	}
+
+	if viper.GetString("oidc.client_secret") == "" && viper.GetString("oidc.client_secret_path") == "" {
+		return errOIDCClientSecretRequired
+	}
+
+	return nil
+}
+
 // Domain returns the hostname/domain part of the [Config.ServerURL].
 // If the [Config.ServerURL] is not a valid URL, it returns the [Config.BaseDomain].
 func (c *Config) Domain() string {
@@ -418,9 +457,6 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("unix_socket", "/var/run/headscale/headscale.sock")
 	viper.SetDefault("unix_socket_permission", "0o770")
 
-	viper.SetDefault("grpc_listen_addr", ":50443")
-	viper.SetDefault("grpc_allow_insecure", false)
-
 	viper.SetDefault("cli.timeout", "5s")
 	viper.SetDefault("cli.insecure", false)
 
@@ -445,6 +481,7 @@ func LoadConfig(path string, isFile bool) error {
 
 	viper.SetDefault("node.expiry", "0")
 	viper.SetDefault("node.ephemeral.inactivity_timeout", "120s")
+	viper.SetDefault("preauth_keys.revoked_retention", "168h")
 	viper.SetDefault("node.routes.ha.probe_interval", "10s")
 	viper.SetDefault("node.routes.ha.probe_timeout", "5s")
 
@@ -559,11 +596,10 @@ func validateServerConfig() error {
 	depr.fatalIfSet("oidc.expiry", "node.expiry")
 
 	// OIDC is activated by setting oidc.issuer (see app.go), not by a
-	// dedicated oidc.enabled key. Gate PKCE method validation on the real
-	// activation condition so an invalid method fails at startup instead of
-	// silently disabling PKCE at runtime.
+	// dedicated oidc.enabled key. Gate validation on the real activation
+	// condition so a misconfiguration fails at startup.
 	if viper.GetString("oidc.issuer") != "" {
-		err := validatePKCEMethod(viper.GetString("oidc.pkce.method"))
+		err := validateOIDCConfig()
 		if err != nil {
 			return err
 		}
@@ -1182,8 +1218,6 @@ func LoadServerConfig() (*Config, error) {
 		ServerURL:          serverURL,
 		Addr:               viper.GetString("listen_addr"),
 		MetricsAddr:        viper.GetString("metrics_listen_addr"),
-		GRPCAddr:           viper.GetString("grpc_listen_addr"),
-		GRPCAllowInsecure:  viper.GetBool("grpc_allow_insecure"),
 		TrustedProxies:     trusted,
 		DisableUpdateCheck: false,
 
@@ -1209,6 +1243,10 @@ func LoadServerConfig() (*Config, error) {
 					ProbeTimeout:  viper.GetDuration("node.routes.ha.probe_timeout"),
 				},
 			},
+		},
+
+		PreAuthKeys: PreAuthKeysConfig{
+			RevokedRetention: viper.GetDuration("preauth_keys.revoked_retention"),
 		},
 
 		Database: databaseConfig(),
