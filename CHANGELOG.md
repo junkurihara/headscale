@@ -46,17 +46,29 @@ keys remain all-access.
 - Improve systemd service file hardening [#3341](https://github.com/juanfont/headscale/pull/3341)
 - Headscale now requires Go 1.27 to build
 
-## 0.29.4 (unreleased)
+## 0.29.4 (2026-09-23)
 
 **Minimum supported Tailscale client version: v1.80.0**
 
 ### Changes
 
+- Fix a node being listed among its own peers in an incremental map update, which crashes the Tailscale Android app on the device list [#3459](https://github.com/juanfont/headscale/pull/3459)
+- Fix deleting a node leaving its long poll open, so the client stayed connected instead of asking for a new login [#3449](https://github.com/juanfont/headscale/pull/3449)
+- Fix interactive OIDC login when the confirmation page is reloaded by an ad blocker, back navigation, or pull-to-refresh; the confirmation page now has its own URL, keeping single-use authorization codes out of reloads [#3448](https://github.com/juanfont/headscale/pull/3448)
+- Harden the OIDC callback: state and nonce cookies take their Secure flag from `server_url` so they survive a TLS-terminating proxy, a callback state is single-use, and an invalid `oidc.issuer` or a missing `oidc.client_id`/`oidc.client_secret` now fails at startup [#3334](https://github.com/juanfont/headscale/pull/3334)
 - Fix HTTP metrics only counting `OPTIONS` requests, so `http_requests_total` and `http_request_duration_seconds` now cover regular traffic [#3414](https://github.com/juanfont/headscale/pull/3414)
 - Fix extra-records filewatcher hanging on shutdown after the watched file is deleted, and leaking the watcher when setup fails [#3437](https://github.com/juanfont/headscale/pull/3437)
+- Lowercase DNS extra record names so mixed-case records resolve [#3366](https://github.com/juanfont/headscale/pull/3366)
 - Fix `headscale users rename` sending the raw `--identifier` flag value instead of the matched user's identifier, so renaming by name works again [#3442](https://github.com/juanfont/headscale/pull/3442)
 - Fix tailsql not shutting down with headscale, leaving the process hanging on graceful shutdown [#3400](https://github.com/juanfont/headscale/pull/3400)
 - Fix tvOS setup instructions: install the VPN configuration before setting the coordination server URL [#3431](https://github.com/juanfont/headscale/pull/3431)
+- Map requests that only bump LastSeen, endpoints or DERP region no longer resend the whole node to every peer, and health probes that change nothing no longer write. Adds `headscale_mapper_changes_dropped_total` and `headscale_ha_health_updates_total` [#3417](https://github.com/juanfont/headscale/issues/3417) [#3450](https://github.com/juanfont/headscale/pull/3450)
+- The peer map is keyed by node ID and reused for writes that cannot change peer visibility, so a routine map request no longer rebuilds it. Adds `headscale_nodestore_snapshot_builds_total` [#3417](https://github.com/juanfont/headscale/issues/3417) [#3450](https://github.com/juanfont/headscale/pull/3450)
+- Fix an expired node staying online forever, because expiring it updated the key deadline without ending its map session [#3472](https://github.com/juanfont/headscale/pull/3472)
+- Fix ACME renewal stopping permanently after a `badNonce` reply, because the error logging middleware drained the response body the acme client needs to detect it [#3461](https://github.com/juanfont/headscale/pull/3461)
+- Fix `#`-prefixed metadata fields being rejected outside `acls`, so policy editors can store metadata in grants, SSH rules and `nodeAttrs` [#3481](https://github.com/juanfont/headscale/pull/3481)
+- Fix exit nodes not offered by recent macOS and iOS clients, which read the `suggest-exit-node` peer attribute rather than the advertised `0.0.0.0/0` routes [#3487](https://github.com/juanfont/headscale/pull/3487)
+- Fix exit node not offered to viewers whose only matching rule is a `via` grant; peer visibility now comes from the peer map alone [#3409](https://github.com/juanfont/headscale/pull/3409)
 
 ## 0.29.3 (2026-07-29)
 
@@ -385,6 +397,8 @@ connected" routers that maintain their control session but cannot route packets.
   - `oidc.expiry` has been removed; use `node.expiry` instead (applies to all registration methods including OIDC)
   - `ephemeral_node_inactivity_timeout` is deprecated in favour of `node.ephemeral.inactivity_timeout`
 - Add `trusted_proxies` to gate `True-Client-IP` / `X-Real-IP` / `X-Forwarded-For` (previously honoured from any client) [#3268](https://github.com/juanfont/headscale/pull/3268)
+- Reject overlapping TCP listener bindings (e.g. `listen_addr` vs ACME HTTP-01 on port 80) at config load [#3236](https://github.com/juanfont/headscale/pull/3236)
+- Improve config and bind-failure errors: every violation reported in one pass, named YAML keys, actionable operator hints [#3236](https://github.com/juanfont/headscale/pull/3236)
 
 #### Debug
 
