@@ -210,8 +210,10 @@ func TestReduceFilterRules(t *testing.T) {
 				// Merged: Both ACL rules combined (same SrcIPs)
 				{
 					SrcIPs: []string{
-						"100.64.0.1-100.64.0.2",
-						"fd7a:115c:a1e0::1-fd7a:115c:a1e0::2",
+						"100.64.0.1",
+						"100.64.0.2",
+						"fd7a:115c:a1e0::1",
+						"fd7a:115c:a1e0::2",
 					},
 					DstPorts: []tailcfg.NetPortRange{
 						{
@@ -355,8 +357,10 @@ func TestReduceFilterRules(t *testing.T) {
 				// by exit node routing via AllowedIPs, not by packet filtering.
 				{
 					SrcIPs: []string{
-						"100.64.0.1-100.64.0.2",
-						"fd7a:115c:a1e0::1-fd7a:115c:a1e0::2",
+						"100.64.0.1",
+						"100.64.0.2",
+						"fd7a:115c:a1e0::1",
+						"fd7a:115c:a1e0::2",
 					},
 					DstPorts: []tailcfg.NetPortRange{
 						{
@@ -461,8 +465,10 @@ func TestReduceFilterRules(t *testing.T) {
 				// Here, 64.0.0.0/2 contains 100.64.0.100 (CGNAT range), so it matches.
 				{
 					SrcIPs: []string{
-						"100.64.0.1-100.64.0.2",
-						"fd7a:115c:a1e0::1-fd7a:115c:a1e0::2",
+						"100.64.0.1",
+						"100.64.0.2",
+						"fd7a:115c:a1e0::1",
+						"fd7a:115c:a1e0::2",
 					},
 					DstPorts: []tailcfg.NetPortRange{
 						{
@@ -538,8 +544,10 @@ func TestReduceFilterRules(t *testing.T) {
 				// Merged: Both ACL rules combined (same SrcIPs)
 				{
 					SrcIPs: []string{
-						"100.64.0.1-100.64.0.2",
-						"fd7a:115c:a1e0::1-fd7a:115c:a1e0::2",
+						"100.64.0.1",
+						"100.64.0.2",
+						"fd7a:115c:a1e0::1",
+						"fd7a:115c:a1e0::2",
 					},
 					DstPorts: []tailcfg.NetPortRange{
 						{
@@ -622,8 +630,10 @@ func TestReduceFilterRules(t *testing.T) {
 				// Merged: Both ACL rules combined (same SrcIPs)
 				{
 					SrcIPs: []string{
-						"100.64.0.1-100.64.0.2",
-						"fd7a:115c:a1e0::1-fd7a:115c:a1e0::2",
+						"100.64.0.1",
+						"100.64.0.2",
+						"fd7a:115c:a1e0::1",
+						"fd7a:115c:a1e0::2",
 					},
 					DstPorts: []tailcfg.NetPortRange{
 						{
@@ -1071,25 +1081,9 @@ func TestReduceFilterRulesCapGrant(t *testing.T) {
 					},
 				},
 			},
-			want: []tailcfg.FilterRule{
-				{
-					SrcIPs: []string{"*"},
-					CapGrant: []tailcfg.CapGrant{
-						{
-							Dsts: []netip.Prefix{
-								// 10.0.0.0/8 doesn't contain node's
-								// CGNAT IP (100.64.0.1), so no IP
-								// narrowing. Only route overlap kept
-								// as original prefix.
-								netip.MustParsePrefix("10.0.0.0/8"),
-							},
-							CapMap: tailcfg.PeerCapMap{
-								"tailscale.com/cap/relay-target": nil,
-							},
-						},
-					},
-				},
-			},
+			// 10.0.0.0/8 doesn't contain the node's CGNAT IP (100.64.0.1),
+			// and routing part of it delivers no capability.
+			want: []tailcfg.FilterRule{},
 		},
 		{
 			name: "capgrant-exit-route-skipped",
@@ -1263,10 +1257,9 @@ func TestReduceFilterRulesCapGrant(t *testing.T) {
 			want: []tailcfg.FilterRule{},
 		},
 		{
-			// A broad prefix that both contains the node IP (/32 narrow)
-			// and overlaps one of its approved subnet routes (route
-			// preserved) would otherwise be emitted twice.
-			name: "capgrant-ip-and-route-overlap-dedup",
+			// Broad prefixes that contain the node IP narrow to the same
+			// /32, and routing them keeps nothing more.
+			name: "capgrant-broad-dsts-narrow-once",
 			node: &types.Node{
 				IPv4: ap("100.64.0.1"),
 				IPv6: ap("fd7a:115c:a1e0::1"),
@@ -1286,6 +1279,7 @@ func TestReduceFilterRulesCapGrant(t *testing.T) {
 						{
 							Dsts: []netip.Prefix{
 								netip.MustParsePrefix("100.64.0.0/24"),
+								netip.MustParsePrefix("100.64.0.0/16"),
 							},
 							CapMap: tailcfg.PeerCapMap{
 								"tailscale.com/cap/relay-target": nil,
@@ -1301,7 +1295,6 @@ func TestReduceFilterRulesCapGrant(t *testing.T) {
 						{
 							Dsts: []netip.Prefix{
 								netip.MustParsePrefix("100.64.0.1/32"),
-								netip.MustParsePrefix("100.64.0.0/24"),
 							},
 							CapMap: tailcfg.PeerCapMap{
 								"tailscale.com/cap/relay-target": nil,
@@ -1413,4 +1406,35 @@ func TestReduceFilterRulesAllocsIndependentOfDests(t *testing.T) {
 
 	require.Equal(t, allocs(10), allocs(1000),
 		"reducing a filter must not allocate per DstPorts entry")
+}
+
+// TestReduceFilterRulesKeepsDestsAsWritten checks that a node keeps the
+// destinations that reach it exactly as written: its own addresses, not a
+// neighbour's, and a written prefix whole; an exit node keeps them all.
+func TestReduceFilterRulesKeepsDestsAsWritten(t *testing.T) {
+	node := &types.Node{IPv4: ap("100.64.0.6"), IPv6: ap("fd7a:115c:a1e0::6")}
+
+	rules := []tailcfg.FilterRule{{
+		SrcIPs: []string{"100.64.0.1"},
+		DstPorts: []tailcfg.NetPortRange{
+			{IP: "100.64.0.6", Ports: tailcfg.PortRange{First: 22, Last: 22}},
+			{IP: "100.64.0.7", Ports: tailcfg.PortRange{First: 22, Last: 22}},
+			{IP: "fd7a:115c:a1e0::6", Ports: tailcfg.PortRange{First: 22, Last: 22}},
+			{IP: "100.64.0.0/12", Ports: tailcfg.PortRangeAny},
+		},
+	}}
+
+	got := policyutil.ReduceFilterRules(node.View(), rules)
+	require.Equal(t, []tailcfg.NetPortRange{
+		{IP: "100.64.0.6", Ports: tailcfg.PortRange{First: 22, Last: 22}},
+		{IP: "fd7a:115c:a1e0::6", Ports: tailcfg.PortRange{First: 22, Last: 22}},
+		{IP: "100.64.0.0/12", Ports: tailcfg.PortRangeAny},
+	}, got[0].DstPorts)
+
+	// An exit node forwards to every destination, so it keeps them all.
+	node.Hostinfo = &tailcfg.Hostinfo{RoutableIPs: tsaddr.ExitRoutes()}
+	node.ApprovedRoutes = tsaddr.ExitRoutes()
+
+	got = policyutil.ReduceFilterRules(node.View(), rules)
+	require.Equal(t, rules[0].DstPorts, got[0].DstPorts)
 }

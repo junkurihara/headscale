@@ -201,8 +201,8 @@ func TestPolicyCheckCommand(t *testing.T) {
 
 // TestSSHTestsRejectFailingPolicy asserts `headscale policy set` rejects
 // a policy whose sshTests fail, surfaces the engine's "test(s) failed"
-// sentinel, and leaves the stored policy unchanged. autogroup:member as
-// dst lets every scenario node count, so no tagged node is needed.
+// sentinel, and leaves the stored policy unchanged. The tests name user1's
+// node by its user, so no tagged node is needed.
 func TestSSHTestsRejectFailingPolicy(t *testing.T) {
 	IntegrationSkip(t)
 
@@ -211,14 +211,15 @@ func TestSSHTestsRejectFailingPolicy(t *testing.T) {
 		user2 = "user2@"
 	)
 
-	// Good policy: user1@ may SSH as root, and the sshTests asserts it.
+	// Good policy: user1@ may SSH as root to its own devices, and the
+	// sshTests asserts it.
 	goodPolicy := policyv2.Policy{
 		SSHs: []policyv2.SSH{
 			{
 				Action:  policyv2.SSHActionAccept,
 				Sources: policyv2.SSHSrcAliases{usernamep(user1)},
 				Destinations: policyv2.SSHDstAliases{
-					new(policyv2.AutoGroupMember),
+					new(policyv2.AutoGroupSelf),
 				},
 				Users: []policyv2.SSHUser{policyv2.SSHUser("root")},
 			},
@@ -226,7 +227,7 @@ func TestSSHTestsRejectFailingPolicy(t *testing.T) {
 		SSHTests: []policyv2.SSHPolicyTest{
 			{
 				Src:    usernamep(user1),
-				Dst:    policyv2.SSHTestDestinations{new(policyv2.AutoGroupMember)},
+				Dst:    policyv2.SSHTestDestinations{usernamep(user1)},
 				Accept: []policyv2.SSHUser{policyv2.SSHUser("root")},
 			},
 		},
@@ -238,7 +239,7 @@ func TestSSHTestsRejectFailingPolicy(t *testing.T) {
 	badPolicy.SSHTests = []policyv2.SSHPolicyTest{
 		{
 			Src:    usernamep(user2),
-			Dst:    policyv2.SSHTestDestinations{new(policyv2.AutoGroupMember)},
+			Dst:    policyv2.SSHTestDestinations{usernamep(user1)},
 			Accept: []policyv2.SSHUser{policyv2.SSHUser("root")},
 		},
 	}

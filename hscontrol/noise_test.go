@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -316,6 +317,117 @@ func TestPollNetMapHandler_OversizedBody(t *testing.T) {
 
 	// Body is truncated → [json.Decoder.Decode] fails → [httpError] returns 500.
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+func pollMapRequest(
+	t *testing.T,
+	ns *noiseServer,
+	remoteAddr string,
+	mapRequest tailcfg.MapRequest,
+) *httptest.ResponseRecorder {
+	t.Helper()
+
+	payload, err := json.Marshal(mapRequest)
+	require.NoError(t, err)
+
+	req := httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		"/machine/map",
+		bytes.NewReader(payload),
+	)
+	req.RemoteAddr = remoteAddr
+	rec := httptest.NewRecorder()
+
+	ns.PollNetMapHandler(rec, req)
+
+	return rec
+}
+
+func TestPollNetMapHandler_LastControlAddress(t *testing.T) {
+	app := createTestApp(t)
+	user := app.state.CreateUserForTest("control-address-user")
+	node := app.state.CreateRegisteredNodeForTest(user, "control-address-node")
+	node.User = user
+	node.Endpoints = types.AddrPorts{
+		netip.MustParseAddrPort("198.51.100.77:41641"),
+	}
+	view := app.state.PutNodeInStoreForTest(*node)
+
+	ns := &noiseServer{headscale: app, machineKey: view.MachineKey()}
+	request := tailcfg.MapRequest{
+		Version:   tailcfg.CurrentCapabilityVersion,
+		NodeKey:   view.NodeKey(),
+		OmitPeers: true,
+		Endpoints: []netip.AddrPort{
+			netip.MustParseAddrPort("198.51.100.77:41641"),
+		},
+	}
+
+	for _, test := range []struct {
+		name       string
+		remoteAddr string
+		want       string
+	}{
+		{name: "direct IPv4 with port", remoteAddr: "203.0.113.10:52184", want: "203.0.113.10"},
+		{name: "direct IPv6 with port", remoteAddr: "[2001:db8::10]:52184", want: "2001:db8::10"},
+		{name: "trusted proxy IPv4 without port", remoteAddr: "192.0.2.44", want: "192.0.2.44"},
+		{name: "trusted proxy IPv6 without port", remoteAddr: "2001:db8::44", want: "2001:db8::44"},
+		{name: "IPv4-mapped IPv6", remoteAddr: "[::ffff:203.0.113.44]:52184", want: "203.0.113.44"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resp := pollMapRequest(t, ns, test.remoteAddr, request)
+			require.Equalf(t, http.StatusOK, resp.Code, "body: %s", resp.Body)
+
+			stored, ok := app.state.GetNodeByID(view.ID())
+			require.True(t, ok)
+			require.True(t, stored.LastControlAddress().Valid())
+			assert.Equal(t, test.want, stored.LastControlAddress().Get().String())
+		})
+	}
+
+	// Seeded, so the cases below do not depend on the ones above.
+	wantUnchanged := netip.MustParseAddr("203.0.113.50")
+	require.NoError(t, app.state.SetLastControlAddress(view.ID(), wantUnchanged))
+
+	t.Run("invalid address is ignored", func(t *testing.T) {
+		resp := pollMapRequest(t, ns, "not-an-address", request)
+		require.Equalf(t, http.StatusOK, resp.Code, "body: %s", resp.Body)
+
+		stored, ok := app.state.GetNodeByID(view.ID())
+		require.True(t, ok)
+		require.True(t, stored.LastControlAddress().Valid())
+		assert.Equal(t, wantUnchanged, stored.LastControlAddress().Get())
+	})
+
+	t.Run("machine key mismatch cannot overwrite", func(t *testing.T) {
+		rogue := &noiseServer{headscale: app, machineKey: key.NewMachine().Public()}
+		resp := pollMapRequest(t, rogue, "192.0.2.99:1234", request)
+		assert.Equal(t, http.StatusNotFound, resp.Code)
+
+		stored, ok := app.state.GetNodeByID(view.ID())
+		require.True(t, ok)
+		assert.Equal(t, wantUnchanged, stored.LastControlAddress().Get())
+	})
+
+	t.Run("unknown node cannot overwrite", func(t *testing.T) {
+		unknownRequest := request
+		unknownRequest.NodeKey = key.NewNode().Public()
+		resp := pollMapRequest(t, ns, "192.0.2.100:1234", unknownRequest)
+		assert.Equal(t, http.StatusNotFound, resp.Code)
+
+		stored, ok := app.state.GetNodeByID(view.ID())
+		require.True(t, ok)
+		assert.Equal(t, wantUnchanged, stored.LastControlAddress().Get())
+	})
+
+	api := registerAPIV2(t, app)
+	attrs := getDevicePostureAttributes(t, api, view.StringID())
+	assert.Equal(t, wantUnchanged.String(), attrs.Attributes["ip:publicAddress"])
+	encodedAttrs, err := json.Marshal(attrs)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encodedAttrs), "198.51.100.77",
+		"reported Magicsock endpoints must not influence posture attributes")
 }
 
 // TestRegistrationHandler_OversizedBody calls the real handler with a
@@ -2378,4 +2490,136 @@ func TestSSHActionFollowUp_ParksOneRequestPerSession(t *testing.T) {
 	last := next("the parked follow-up did not collect the verdict")
 	require.NoError(t, last.err)
 	assert.True(t, last.action.Accept, "accept, got %+v", last.action)
+}
+
+func newC2NResponseRequest(c2nID string, body []byte) *http.Request {
+	return httptest.NewRequestWithContext(
+		context.Background(),
+		http.MethodPost,
+		"/machine/c2n-response?id="+c2nID,
+		bytes.NewReader(body),
+	)
+}
+
+// TestC2NResponseHandler_DeliversBody verifies that the target node's
+// Noise session completes its pending c2n request with the raw body.
+func TestC2NResponseHandler_DeliversBody(t *testing.T) {
+	t.Parallel()
+
+	app := createTestApp(t)
+	user := app.state.CreateUserForTest("c2n-user")
+	node := putTestNodeInStore(t, app, user, "c2n-node")
+
+	c2nID, responseCh := app.state.RegisterC2N(node.ID)
+	defer app.state.CancelC2N(c2nID)
+
+	ns := &noiseServer{headscale: app, machineKey: node.MachineKey}
+
+	const raw = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+
+	rec := httptest.NewRecorder()
+	ns.C2NResponseHandler(rec, newC2NResponseRequest(c2nID, []byte(raw)))
+
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+
+	select {
+	case body := <-responseCh:
+		assert.Equal(t, raw, string(body))
+	case <-time.After(time.Second):
+		t.Fatal("c2n response not delivered")
+	}
+}
+
+// TestC2NResponseHandler_RejectsRogueMachineKey verifies that a Noise
+// session of another machine cannot answer a c2n request sent to a node.
+func TestC2NResponseHandler_RejectsRogueMachineKey(t *testing.T) {
+	t.Parallel()
+
+	app := createTestApp(t)
+	user := app.state.CreateUserForTest("c2n-rogue-user")
+	node := putTestNodeInStore(t, app, user, "c2n-node")
+
+	c2nID, responseCh := app.state.RegisterC2N(node.ID)
+	defer app.state.CancelC2N(c2nID)
+
+	ns := &noiseServer{headscale: app, machineKey: key.NewMachine().Public()}
+
+	rec := httptest.NewRecorder()
+	ns.C2NResponseHandler(rec, newC2NResponseRequest(c2nID, []byte("HTTP/1.1 200 OK\r\n\r\n")))
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+
+	_, pending := app.state.C2NTarget(c2nID)
+	assert.True(t, pending, "rejected response must leave the request pending")
+
+	select {
+	case <-responseCh:
+		t.Fatal("rejected response must not be delivered")
+	default:
+	}
+}
+
+// TestC2NResponseHandler_UnknownID verifies that responses without a
+// pending request are refused.
+func TestC2NResponseHandler_UnknownID(t *testing.T) {
+	t.Parallel()
+
+	app := createTestApp(t)
+	ns := &noiseServer{headscale: app, machineKey: key.NewMachine().Public()}
+
+	for id, want := range map[string]int{
+		"":        http.StatusBadRequest,
+		"unknown": http.StatusNotFound,
+	} {
+		rec := httptest.NewRecorder()
+		ns.C2NResponseHandler(rec, newC2NResponseRequest(id, nil))
+
+		assert.Equal(t, want, rec.Code, "id %q", id)
+	}
+}
+
+// TestC2NResponseHandler_OversizedBody verifies that the body is capped
+// at [maxC2NResponseBytes] and the request stays pending.
+func TestC2NResponseHandler_OversizedBody(t *testing.T) {
+	t.Parallel()
+
+	app := createTestApp(t)
+	user := app.state.CreateUserForTest("c2n-big-user")
+	node := putTestNodeInStore(t, app, user, "c2n-node")
+
+	c2nID, _ := app.state.RegisterC2N(node.ID)
+	defer app.state.CancelC2N(c2nID)
+
+	ns := &noiseServer{headscale: app, machineKey: node.MachineKey}
+
+	rec := httptest.NewRecorder()
+	ns.C2NResponseHandler(rec, newC2NResponseRequest(c2nID, bytes.Repeat([]byte("a"), maxC2NResponseBytes+1)))
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+
+	_, pending := app.state.C2NTarget(c2nID)
+	assert.True(t, pending)
+}
+
+// TestC2NResponseHandler_BrokenBody verifies that a body that fails to read
+// for another reason than its size is a 400, not a 413.
+func TestC2NResponseHandler_BrokenBody(t *testing.T) {
+	t.Parallel()
+
+	app := createTestApp(t)
+	user := app.state.CreateUserForTest("c2n-broken-user")
+	node := putTestNodeInStore(t, app, user, "c2n-node")
+
+	c2nID, _ := app.state.RegisterC2N(node.ID)
+	defer app.state.CancelC2N(c2nID)
+
+	ns := &noiseServer{headscale: app, machineKey: node.MachineKey}
+
+	req := newC2NResponseRequest(c2nID, nil)
+	req.Body = io.NopCloser(iotest.ErrReader(io.ErrUnexpectedEOF))
+
+	rec := httptest.NewRecorder()
+	ns.C2NResponseHandler(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }

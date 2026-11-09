@@ -262,6 +262,7 @@ jobs:
           - TestAuthWebFlowReloginExpiredNode
           - TestAuthWebFlowLogoutAndReloginNewUser
           - TestTailscaleCert
+          - TestTLSCertificateReload
           - TestApiKeyCommand
           - TestApiKeyCommandValidation
           - TestAuthCommandValidation
@@ -275,6 +276,7 @@ jobs:
           - TestNodeTagCommand
           - TestNodeRouteCommands
           - TestNodeBackfillIPsCommand
+          - TestNodeUpdateClientCommand
           - TestOAuthClientCommand
           - TestOAuthClientCommandValidation
           - TestPolicyCheckCommand
@@ -358,7 +360,7 @@ jobs:
           - TestTagsReauthDifferentKeyRetagsNode
           - TestTagsReauthDifferentKeyRemovesTag
           - TestTagsAuthKeyWithTagCLICannotModifyAdminTags
-          - TestTagsAuthKeyWithoutTagCannotRequestTags
+          - TestTagsAuthKeyWithoutTagCanRequestOwnedTag
           - TestTagsAuthKeyWithoutTagRegisterNoTags
           - TestTagsAuthKeyWithoutTagCannotAddViaCLI
           - TestTagsAuthKeyWithoutTagCLINoOpAfterAdminWithReset

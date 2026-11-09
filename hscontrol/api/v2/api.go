@@ -38,12 +38,21 @@ type Backend struct {
 	State  *state.State
 	Change func(...change.Change)
 	Cfg    *types.Config
+	// Connected reports whether a node has a live map stream. A node stays
+	// online through the disconnect grace period, but only a stream can
+	// carry a c2n request.
+	Connected func(types.NodeID) bool
 }
 
 // security is the requirement applied to authenticated operations: an API key
 // presented as HTTP Basic (the key as username, what the Tailscale SDK sends)
 // or as a Bearer token.
 var security = []map[string][]string{{"basicAuth": {}}, {"bearerAuth": {}}}
+
+// maxBodyBytes replaces huma's 1 MiB default on operations whose body huma
+// validates: validation records an error per bad element before the handler
+// runs, and a real body is a few names, tags or routes.
+const maxBodyBytes = 64 << 10
 
 // registrations is populated by each resource file's init(), so adding a
 // resource means adding a file rather than editing a shared list.
@@ -126,6 +135,15 @@ func Spec() ([]byte, error) {
 // oapi-codegen cannot yet read 3.1; the typed client is generated from this.
 func Spec30() ([]byte, error) {
 	api := NewAPI(chi.NewMux(), Backend{})
+
+	// additionalProperties:true is the default, and spelled out it makes
+	// oapi-codegen write marshalers that drop a nil required list, sending
+	// {} where the server needs "tags":null.
+	for _, s := range api.OpenAPI().Components.Schemas.Map() {
+		if s.AdditionalProperties == true {
+			s.AdditionalProperties = nil
+		}
+	}
 
 	return api.OpenAPI().DowngradeYAML()
 }

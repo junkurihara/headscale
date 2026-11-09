@@ -3,6 +3,7 @@ package policyutil
 import (
 	"net/netip"
 	"slices"
+	"strings"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -11,17 +12,33 @@ import (
 )
 
 // ReduceFilterRules takes a node and a set of global filter rules and removes all rules
-// and destinations that are not relevant to that particular node.
+// and destinations that are not relevant to that particular node. Rules list
+// node addresses one by one, so a node keeps its own and those its routes
+// cover, as Tailscale sends them.
 //
 // IMPORTANT: This function is designed for global filters only. Per-node filters
 // (from autogroup:self policies) are already node-specific and should not be passed
 // to this function. Use [policy.PolicyManager.FilterForNode] instead, which handles
 // both cases.
-func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcfg.FilterRule {
+func ReduceFilterRules(
+	node types.NodeView,
+	rules []tailcfg.FilterRule,
+) []tailcfg.FilterRule {
 	ret := []tailcfg.FilterRule{}
 	nodeIPs := node.IPs()
 	subnetRoutes := node.SubnetRoutes()
 	exitRoutes := node.ExitRoutes()
+
+	// A rule lists every node address it names, so most entries are single
+	// addresses. Without routes, one reaches the node only as one of its own
+	// addresses; both are written by [netip.Addr.String], so the text says
+	// so without parsing every entry for every node.
+	routed := len(subnetRoutes) > 0 || len(exitRoutes) > 0
+	ownIPs := make([]string, len(nodeIPs))
+
+	for i, ip := range nodeIPs {
+		ownIPs[i] = ip.String()
+	}
 
 	for _, rule := range rules {
 		// Handle CapGrant rules separately — they use CapGrant[].Dsts
@@ -39,6 +56,14 @@ func ReduceFilterRules(node types.NodeView, rules []tailcfg.FilterRule) []tailcf
 		var dests []tailcfg.NetPortRange
 
 		for _, dest := range rule.DstPorts {
+			if !routed && !strings.ContainsAny(dest.IP, "/-*") {
+				if slices.Contains(ownIPs, dest.IP) {
+					dests = append(dests, dest)
+				}
+
+				continue
+			}
+
 			if destReachesNode(dest.IP, nodeIPs, subnetRoutes, exitRoutes) {
 				dests = append(dests, dest)
 			}
@@ -87,7 +112,9 @@ func destReachesNode(dst string, nodeIPs []netip.Addr, subnetRoutes, exitRoutes 
 // [tailcfg.CapGrant] entries whose Dsts match the given node's IPs. When a
 // broad prefix (e.g. 100.64.0.0/10 from dst:*) contains a node's IP, it is
 // narrowed to the node's specific /32 or /128 prefix. Returns nil if
-// no [tailcfg.CapGrant] entries are relevant to this node.
+// no [tailcfg.CapGrant] entries are relevant to this node. A destination the
+// node only routes is not relevant: via-grant-v84 and v86 show SaaS sending a
+// router no capability for its subnet.
 func reduceCapGrantRule(
 	node types.NodeView,
 	rule tailcfg.FilterRule,
@@ -95,7 +122,6 @@ func reduceCapGrantRule(
 	var capGrants []tailcfg.CapGrant
 
 	nodeIPs := node.IPs()
-	subnetRoutes := node.SubnetRoutes()
 
 	for _, cg := range rule.CapGrant {
 		// Collect the node's IPs that fall within any of this
@@ -120,27 +146,9 @@ func reduceCapGrantRule(
 			}
 		}
 
-		// Asymmetric on purpose: the IP-match loop above narrows broad
-		// prefixes to node-specific /32 or /128 so peers receive only
-		// the minimum routing surface. The route-match loop below
-		// preserves the original prefix so the subnet-serving node
-		// receives the full CapGrant scope. [types.NodeView.SubnetRoutes]
-		// excludes both unapproved and exit routes, matching Tailscale
-		// SaaS behavior.
-		for _, dst := range cg.Dsts {
-			for _, subnetRoute := range subnetRoutes {
-				if dst.Overlaps(subnetRoute) {
-					// For route overlaps, keep the original prefix.
-					matchingDsts = append(matchingDsts, dst)
-				}
-			}
-		}
-
 		if len(matchingDsts) > 0 {
-			// A Dst can be appended twice when a broad prefix both
-			// contains a node IP and overlaps one of its approved
-			// subnet routes. Sort + Compact dedups; [netip.Prefix] is
-			// comparable so Compact works with ==.
+			// Several Dsts can narrow to the same node IP. Sort + Compact
+			// dedups; [netip.Prefix] is comparable so Compact works with ==.
 			slices.SortFunc(matchingDsts, netip.Prefix.Compare)
 			matchingDsts = slices.Compact(matchingDsts)
 

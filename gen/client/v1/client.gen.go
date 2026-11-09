@@ -229,6 +229,7 @@ type Node struct {
 	AvailableRoutes []string           `json:"availableRoutes"`
 	CreatedAt       time.Time          `json:"createdAt"`
 	DiscoKey        string             `json:"discoKey"`
+	Ephemeral       bool               `json:"ephemeral"`
 	Expiry          *time.Time         `json:"expiry"`
 	GivenName       string             `json:"givenName"`
 	Id              string             `json:"id"`
@@ -279,15 +280,15 @@ type PolicyResponseBody struct {
 
 // PreAuthKey defines model for PreAuthKey.
 type PreAuthKey struct {
-	AclTags    []string  `json:"aclTags"`
-	CreatedAt  time.Time `json:"createdAt"`
-	Ephemeral  bool      `json:"ephemeral"`
-	Expiration time.Time `json:"expiration"`
-	Id         string    `json:"id"`
-	Key        string    `json:"key"`
-	Reusable   bool      `json:"reusable"`
-	Used       bool      `json:"used"`
-	User       User      `json:"user"`
+	AclTags    []string   `json:"aclTags"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	Ephemeral  bool       `json:"ephemeral"`
+	Expiration *time.Time `json:"expiration"`
+	Id         string     `json:"id"`
+	Key        string     `json:"key"`
+	Reusable   bool       `json:"reusable"`
+	Used       bool       `json:"used"`
+	User       User       `json:"user"`
 }
 
 // PreAuthKeyOutputBody defines model for PreAuthKeyOutputBody.
